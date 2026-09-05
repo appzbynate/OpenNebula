@@ -15,3 +15,5 @@ app/release
 app/debug
 /app/build
 /tmp/
+tools/xr-bridge/.venv/
+tools/xr-bridge/hmd_driver/

@@ -101,6 +101,9 @@ fun SpatialHome(viewModel: GlassesViewModel) {
                 Button(onClick = viewModel::recenter) {
                     Text(if (worldLocked) "Recenter" else "Anchor", fontSize = 20.sp)
                 }
+                OutlinedButton(onClick = { viewModel.startCalibration(false) }) {
+                    Text("Calibrate", fontSize = 18.sp)
+                }
                 OutlinedButton(onClick = viewModel::toggleMarkers) {
                     Text(if (markers) "Hide markers" else "Show markers", fontSize = 18.sp)
                 }
@@ -115,8 +118,8 @@ fun SpatialHome(viewModel: GlassesViewModel) {
             )
             Text(
                 if (display.presenting) {
-                    if (worldLocked) "World locked — nod: pitch must change. Look left: yaw must change."
-                    else "Waiting 1s still, then auto-Anchor…"
+                    if (worldLocked) "World locked — use Calibrate if icons crawl after sitting still."
+                    else "Open Calibrate on the phone — hold still, then Anchor."
                 } else {
                     "NOT presenting on glasses — you may be seeing a phone mirror. IMU cannot plant that."
                 },

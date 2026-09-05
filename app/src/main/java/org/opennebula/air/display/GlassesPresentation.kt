@@ -38,11 +38,12 @@ class GlassesPresentation(
     gridOpen: AtomicBoolean,
     gridPose: AtomicReference<SpatialWindow>,
     browser: MirrorPipeline,
+    steamVr: MirrorPipeline,
 ) : Presentation(context, display, android.R.style.Theme_Black_NoTitleBar_Fullscreen) {
 
     private val renderer = WorldRenderer(
         poseRef, layers, focusedId, showMarkers, stereoEnabled, ipdMeters, pointerBeam, mirror, chrome,
-        iconGrid, gridOpen, gridPose, browser,
+        iconGrid, gridOpen, gridPose, browser, steamVr,
     )
     private val surface = GLSurfaceView(context).apply {
         setEGLContextClientVersion(2)

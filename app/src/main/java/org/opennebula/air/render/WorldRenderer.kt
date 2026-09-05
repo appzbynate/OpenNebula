@@ -45,6 +45,7 @@ class WorldRenderer(
     private val gridOpen: AtomicBoolean,
     private val gridPose: AtomicReference<SpatialWindow>,
     private val browser: MirrorPipeline,
+    private val steamVr: MirrorPipeline,
 ) : GLSurfaceView.Renderer {
     private var colorProg = 0
     private var texProg = 0
@@ -80,6 +81,8 @@ class WorldRenderer(
     private var lastMirrorPose: SpatialWindow? = null
     private var browserTex = 0
     private var lastBrowserGen = -1
+    private var steamVrTex = 0
+    private var lastSteamVrGen = -1
     private lateinit var mirrorPanelTris: FloatBuffer
     private var mirrorPanelCount = 0
     private lateinit var mirrorBezelTris: FloatBuffer
@@ -89,6 +92,17 @@ class WorldRenderer(
     private lateinit var browserBezelTris: FloatBuffer
     private var browserBezelCount = 0
     private var lastBrowserPose: SpatialWindow? = null
+    private lateinit var steamVrPanelTris: FloatBuffer
+    private var steamVrPanelCount = 0
+    private lateinit var steamVrBezelTris: FloatBuffer
+    private var steamVrBezelCount = 0
+    private var lastSteamVrPose: SpatialWindow? = null
+    /** NDC fullscreen quad for immersive SteamVR (no floating AR panel). */
+    private lateinit var immersiveQuad: FloatBuffer
+    private var immersiveQuadCount = 0
+    private val identityMvp = FloatArray(16) { 0f }.also {
+        it[0] = 1f; it[5] = 1f; it[10] = 1f; it[15] = 1f
+    }
     private val iconTex = HashMap<String, Int>()
     private val iconDraw = ArrayList<IconMesh>()
     private var lastIconGen = -1
@@ -154,6 +168,7 @@ class WorldRenderer(
         // Home/Notes Compose panels stay off-screen; the icon grid and ImageReader browser replace them.
         mirrorTex = genTex()
         browserTex = genTex()
+        steamVrTex = genTex()
         val mp = mirror.pose.get()
         lastMirrorPose = mp
         mirrorBezelTris = pack(buildBezel(mp))
@@ -166,6 +181,24 @@ class WorldRenderer(
         browserBezelCount = browserBezelTris.capacity() / COLOR_STRIDE
         browserPanelTris = packUv(buildPanel(bp))
         browserPanelCount = browserPanelTris.capacity() / UV_STRIDE
+        val sp = steamVr.pose.get()
+        lastSteamVrPose = sp
+        steamVrBezelTris = pack(buildBezel(sp))
+        steamVrBezelCount = steamVrBezelTris.capacity() / COLOR_STRIDE
+        steamVrPanelTris = packUv(buildPanel(sp))
+        steamVrPanelCount = steamVrPanelTris.capacity() / UV_STRIDE
+        // Fullscreen NDC: x,y,z,u,v — covers the eye viewport.
+        immersiveQuad = packUv(
+            listOf(
+                -1f, -1f, 0f, 0f, 1f,
+                1f, -1f, 0f, 1f, 1f,
+                -1f, 1f, 0f, 0f, 0f,
+                -1f, 1f, 0f, 0f, 0f,
+                1f, -1f, 0f, 1f, 1f,
+                1f, 1f, 0f, 1f, 0f,
+            ),
+        )
+        immersiveQuadCount = 6
         iconTex.clear()
         iconDraw.clear()
         lastIconGen = -1
@@ -195,9 +228,10 @@ class WorldRenderer(
         uploadLayers()
         uploadMirror()
         uploadBrowser()
+        uploadSteamVr()
         uploadIcons()
-        // Raw fusion → view. Display hold/1€ caused hold-chatter jitters + lag snaps
-        // ("drifting away"). Depth + motion CSV stay for diagnosis.
+        // Raw fusion → view (motion-smooth 0.8.93 caused complaint; restore baseline display).
+        // Tag baseline-0.8.92 remains the full restore point.
         val raw = poseRef.get()
         val centerView = PoseMath.viewFromQuat(raw.qw, raw.qx, raw.qy, raw.qz)
         val panelX = SpatialLayout.PANEL_X
@@ -221,6 +255,13 @@ class WorldRenderer(
             ),
         )
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
+        // Translucent Presentation: SteamVR needs opaque clear or the layer stays invisible.
+        if (steamVr.enabled.get() && steamVr.generation.get() > 0) {
+            GLES20.glClearColor(0f, 0f, 0f, 1f)
+            GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+        } else {
+            GLES20.glClearColor(0f, 0f, 0f, 0f)
+        }
         val stereo = stereoEnabled.get() && surfaceW >= 2
         if (stereo) {
             val half = surfaceW / 2
@@ -255,6 +296,16 @@ class WorldRenderer(
         centerView: FloatArray,
     ) {
         GLES20.glViewport(x, y, w, h)
+        // Immersive SteamVR only while actively streaming (enabled + frames).
+        if (steamVr.enabled.get() && steamVr.generation.get() > 0) {
+            uploadSteamVr()
+            GLES20.glDisable(GLES20.GL_BLEND)
+            GLES20.glDisable(GLES20.GL_DEPTH_TEST)
+            drawTex(identityMvp, steamVrTex, immersiveQuad, immersiveQuadCount, opaque = true)
+            GLES20.glEnable(GLES20.GL_DEPTH_TEST)
+            GLES20.glEnable(GLES20.GL_BLEND)
+            return
+        }
         val mvp = PoseMath.multiply(proj, centerView)
         if (showMarkers.get()) {
             drawColor(mvp, markerTris, markerTriCount, GLES20.GL_TRIANGLES)
@@ -289,7 +340,7 @@ class WorldRenderer(
             val panel: FloatBuffer,
             val panelCount: Int,
         )
-        val passes = ArrayList<Pass>(2)
+        val passes = ArrayList<Pass>(3)
         if (browser.enabled.get()) {
             passes += Pass(
                 browser.pose.get().z,
@@ -304,6 +355,13 @@ class WorldRenderer(
                 mirrorTex, mirrorPanelTris, mirrorPanelCount,
             )
         }
+        if (steamVr.enabled.get() && lastSteamVrGen > 0) {
+            passes += Pass(
+                steamVr.pose.get().z,
+                steamVrBezelTris, steamVrBezelCount,
+                steamVrTex, steamVrPanelTris, steamVrPanelCount,
+            )
+        }
         if (passes.isEmpty()) return
         passes.sortBy { it.z }
         GLES20.glDepthMask(true)
@@ -316,6 +374,7 @@ class WorldRenderer(
         val id = focusedId.get()
         if (id == SpatialBrowser.ID && browser.enabled.get()) return browser.pose.get()
         if (id == MirrorPipeline.ID && mirror.enabled.get()) return mirror.pose.get()
+        if (id == MirrorPipeline.STEAMVR_ID && steamVr.enabled.get()) return steamVr.pose.get()
         if (gridOpen.get()) return gridPose.get()
         return layers.firstOrNull { it.id == id }?.pose?.get() ?: gridPose.get()
     }
@@ -384,6 +443,31 @@ class WorldRenderer(
             val panel = buildPanel(pose)
             writeUv(browserPanelTris, panel)
             browserPanelCount = minOf(panel.size, browserPanelTris.capacity()) / UV_STRIDE
+        }
+    }
+
+    private fun uploadSteamVr() {
+        if (!steamVr.enabled.get()) return
+        val gen = steamVr.generation.get()
+        if (gen != lastSteamVrGen) {
+            var uploaded = false
+            steamVr.withBitmap { bmp ->
+                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, steamVrTex)
+                GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
+                uploaded = true
+            }
+            // Only advance gen when a bitmap was actually uploaded (avoid stuck black tex).
+            if (uploaded) lastSteamVrGen = gen
+        }
+        val pose = steamVr.pose.get()
+        if (pose != lastSteamVrPose) {
+            lastSteamVrPose = pose
+            val bezel = buildBezel(pose)
+            write(steamVrBezelTris, bezel)
+            steamVrBezelCount = minOf(bezel.size, steamVrBezelTris.capacity()) / COLOR_STRIDE
+            val panel = buildPanel(pose)
+            writeUv(steamVrPanelTris, panel)
+            steamVrPanelCount = minOf(panel.size, steamVrPanelTris.capacity()) / UV_STRIDE
         }
     }
 
@@ -533,6 +617,11 @@ class WorldRenderer(
                 u = mirror.cursorX.get()
                 v = mirror.cursorY.get()
             }
+            id == MirrorPipeline.STEAMVR_ID && steamVr.enabled.get() -> {
+                window = steamVr.pose.get()
+                u = steamVr.cursorX.get()
+                v = steamVr.cursorY.get()
+            }
             else -> {
                 cursorCount = 0
                 return
@@ -591,6 +680,7 @@ class WorldRenderer(
                 data, MirrorPipeline.ID, mirror.pose.get(), hoverLayer, hoverHandle, grab, focus, expandedId,
             )
         }
+        // No chrome in immersive SteamVR.
         if (data.isEmpty()) return 0
         write(chromeTris, data)
         return minOf(data.size, chromeTris.capacity()) / COLOR_STRIDE

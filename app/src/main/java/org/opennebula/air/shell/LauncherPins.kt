@@ -11,6 +11,7 @@ object LauncherPins {
     val DEFAULT: List<String> = listOf(
         ShellApps.SCREEN,
         ShellApps.EXTENDED,
+        ShellApps.STEAMVR,
         WebApps.component("youtube"),
         WebApps.component("parsec"),
         WebApps.component("twitch"),

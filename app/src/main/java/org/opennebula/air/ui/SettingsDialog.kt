@@ -70,12 +70,20 @@ fun SettingsDialog(
                 ) {
                     Switch(checked = stereo, onCheckedChange = viewModel::setStereo)
                     Text(
-                        if (stereo) "Stereo SBS. Press the glasses arm button for 3D hardware mode."
+                        if (stereo) "Stereo SBS — OpenNebula sets hardware 3D automatically."
                         else "Mono — single camera",
                         style = MaterialTheme.typography.bodyMedium,
                         modifier = Modifier.weight(1f),
                     )
                 }
+                val brightness by viewModel.brightness.collectAsStateWithLifecycle()
+                Text("Brightness $brightness / 7", fontSize = 13.sp)
+                Slider(
+                    value = brightness.toFloat(),
+                    onValueChange = { viewModel.setBrightness(it.toInt()) },
+                    valueRange = 0f..7f,
+                    steps = 6,
+                )
                 if (stereo) {
                     Text("IPD ${"%.0f".format(ipd * 1000f)} mm", fontSize = 13.sp)
                     Slider(

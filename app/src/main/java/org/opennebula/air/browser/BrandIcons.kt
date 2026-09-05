@@ -29,6 +29,8 @@ object BrandIcons {
 
     fun extendedDisplay(): Bitmap = cache.getOrPut("shell:extended") { IconSculpt.extended() }
 
+    fun steamVr(): Bitmap = cache.getOrPut("shell:steamvr") { IconSculpt.steamVr() }
+
     internal fun knownPackage(item: WebAppItem, packageName: String): Boolean {
         return item.packages.any { it.equals(packageName, ignoreCase = true) }
     }

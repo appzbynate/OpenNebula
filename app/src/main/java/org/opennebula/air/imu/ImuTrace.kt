@@ -233,6 +233,9 @@ class ImuTrace(
             append(stillN); append(',')
             append("%.2f".format(rateEma)); append(',')
             append(grav); append(',')
+            append("%.2f".format(MadgwickImu.REST_ENTER_DPS)); append(',')
+            append("%.2f".format(MadgwickImu.REST_EXIT_HARD_DPS)); append(',')
+            append("%.2f".format(MadgwickImu.GAIN)); append(',')
             append("%.2f".format(-SpatialLayout.PANEL_Z)); append(',')
             append(appVersion)
         }
@@ -253,7 +256,18 @@ class ImuTrace(
                     "ypr=${"%.2f".format(pose.yawDeg)},${"%.2f".format(pose.pitchDeg)},${"%.2f".format(pose.rollDeg)} " +
                     "objJ=${"%.4f".format(objJump)} rest=$rest grav=$grav still=$stillN " +
                     "bias=${"%.2f".format(b.x)},${"%.2f".format(b.y)},${"%.2f".format(b.z)} " +
-                    "aErr=${"%.3f".format(accelErr)}",
+                    "enter=${MadgwickImu.REST_ENTER_DPS} exitH=${MadgwickImu.REST_EXIT_HARD_DPS} " +
+                    "gain=${MadgwickImu.GAIN} aErr=${"%.3f".format(accelErr)}",
+            )
+        }
+
+        // Extra burst logging while moving — richer than 5 Hz for ratchet diagnosis.
+        if (rest == 0 && n % 5 == 0) {
+            Log.i(
+                LogTags.MOTION,
+                "MOVE gx=${"%.2f".format(sample.gyroDps.x)},${"%.2f".format(sample.gyroDps.y)},${"%.2f".format(sample.gyroDps.z)} " +
+                    "corr=${"%.2f".format(cx)},${"%.2f".format(cy)},${"%.2f".format(cz)} " +
+                    "Δobj=${"%.4f".format(objDx)},${"%.4f".format(objDy)}",
             )
         }
 
@@ -380,7 +394,7 @@ class ImuTrace(
                 "ax,ay,az,accel_mag,accel_err,yaw,pitch,roll,qw,qx,qy,qz," +
                 "dqw,dqx,dqy,dqz,hold,lag_deg," +
                 "obj_x,obj_y,obj_z,obj_dx,obj_dy,obj_jump," +
-                "bx,by,bz,gain,rest,still_n,rate_ema,grav,panel_m,version\n"
+                "bx,by,bz,gain,rest,still_n,rate_ema,grav,rest_enter,rest_exit_hard,grav_gain,panel_m,version\n"
         const val EVENT_HEADER = "n,host_ms,kind,detail\n"
 
         private const val DECIMATE = 20 // 1000 → 50 Hz

@@ -127,6 +127,32 @@ class MirrorPipeline {
         }
     }
 
+    /** Software frame path (XR bridge MJPEG). Recycles the source bitmap. */
+    fun pushBitmap(src: Bitmap) {
+        val w = src.width.coerceAtLeast(2)
+        val h = src.height.coerceAtLeast(2)
+        synchronized(lock) {
+            bufferW.set(w)
+            bufferH.set(h)
+            var bmp = bitmap
+            if (bmp == null || bmp.width != w || bmp.height != h) {
+                bitmap?.recycle()
+                bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                bitmap = bmp
+            }
+            val c = android.graphics.Canvas(bmp!!)
+            c.drawBitmap(src, 0f, 0f, null)
+            forceOpaque(bmp)
+            bmp.setHasAlpha(false)
+            generation.incrementAndGet()
+        }
+        if (!src.isRecycled) src.recycle()
+        val n = frames.incrementAndGet()
+        if (n == 1 || n % 120 == 0) {
+            log("xr frames=$n ${w}x$h")
+        }
+    }
+
     fun log(message: String) {
         Log.i(LogTags.MIRROR, message)
         mainPost { onLog?.invoke(message) }
@@ -238,6 +264,7 @@ class MirrorPipeline {
 
     companion object {
         const val ID = "screen"
+        const val STEAMVR_ID = "steamvr"
         private const val OPAQUE = 0xFF000000.toInt()
 
         fun opaqueArgb(r: Int, g: Int, b: Int): Int {

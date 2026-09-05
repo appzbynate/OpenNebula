@@ -8,11 +8,18 @@ import android.os.Build
 import android.view.WindowManager
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.util.concurrent.atomic.AtomicBoolean
 import android.view.MotionEvent
 import org.opennebula.air.browser.BrandIcons
 import org.opennebula.air.browser.SpatialBrowser
@@ -50,7 +57,8 @@ import org.opennebula.air.shell.WindowChrome
 import org.opennebula.air.shell.WindowChromeState
 import org.opennebula.air.usb.GlassesConnectionState
 import org.opennebula.air.usb.NrealAirUsbClient
-import java.util.concurrent.atomic.AtomicBoolean
+import org.opennebula.air.xr.SteamVrSession
+import org.opennebula.air.xr.XrHost
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.abs
@@ -99,9 +107,23 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
         getApplication(),
         MirrorPipeline(),
     ) { appendLog(LogTags.BROWSER, it) }
+    val steamVrPipeline = MirrorPipeline()
+    private val steamVr = SteamVrSession(
+        context = getApplication(),
+        scope = viewModelScope,
+        pipeline = steamVrPipeline,
+        onLog = { appendLog(LogTags.UI, it) },
+        onExitToHome = {
+            viewModelScope.launch(Dispatchers.Main) {
+                showGrid()
+            }
+        },
+    )
+    val steamVrUi = steamVr.ui
     private val worldLock = AtomicBoolean(false)
     private val poseLock = Any()
     private val autoAnchored = AtomicBoolean(false)
+    private var calibrationJob: Job? = null
     private val prefs = DisplayPrefs(application)
     private val launcherPrefs = LauncherPrefs(application)
     private val haptics = TrackballHaptics(application)
@@ -133,6 +155,7 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
         gridOpen = gridOpen,
         gridPose = windowRef,
         browser = browser.pipeline,
+        steamVr = steamVrPipeline,
         onLog = { tag, message -> appendLog(tag, message) },
     )
     val displayStatus: StateFlow<GlassesDisplayStatus> = displays.status
@@ -162,8 +185,15 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
     private val _worldLocked = MutableStateFlow(false)
     val worldLocked: StateFlow<Boolean> = _worldLocked.asStateFlow()
 
+    private val _calibration = MutableStateFlow(CalibrationUiState())
+    val calibration: StateFlow<CalibrationUiState> = _calibration.asStateFlow()
+
     private val _stereo = MutableStateFlow(true)
     val stereo: StateFlow<Boolean> = _stereo.asStateFlow()
+    private val _brightness = MutableStateFlow(5)
+    val brightness: StateFlow<Int> = _brightness.asStateFlow()
+    /** Stereo preference before SteamVR forced hardware 3D; restored on disconnect. */
+    private var stereoBeforeSteamVr: Boolean? = null
 
     private val _distance = MutableStateFlow(-SpatialLayout.PANEL_Z)
     val distance: StateFlow<Float> = _distance.asStateFlow()
@@ -220,18 +250,13 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
     private var gridPan = 0f
     private var promptedConnectMode = false
     private var mirrorHidesGrid = false
+    private var promptedCalibration = false
     private var lastConnection: GlassesConnectionState = GlassesConnectionState.Disconnected
 
     init {
         client.onGlassesPose = { pose ->
-            // Always drive the glasses view with fused pose. Sending IDENTITY until
-            // Anchor meant IMU/fusion changes could not affect what you see.
-            if (!autoAnchored.get() && client.biasReady()) {
-                autoAnchored.set(true)
-                recenter()
-            } else {
-                displays.publishPose(pose, client.lastGyroRadS())
-            }
+            displays.publishPose(pose, client.lastGyroRadS())
+            steamVr.onPose(pose)
         }
         client.onImuDebug = { line -> _imuDebug.value = line }
         viewModelScope.launch {
@@ -240,13 +265,30 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
                     promptedConnectMode = true
                     _promptConnectMode.value = true
                 }
+                if (ConnectMode.enteredStreaming(lastConnection, state) && !promptedCalibration) {
+                    promptedCalibration = true
+                    startCalibration(fromAuto = true)
+                }
+                // Fresh glasses plug-in: never keep a stale SteamVR / "Video lost" layer.
+                if (ConnectMode.enteredStreaming(lastConnection, state) && !steamVr.isConnected()) {
+                    steamVr.disconnect()
+                    showGrid()
+                }
+                if (ConnectMode.enteredStreaming(lastConnection, state)) {
+                    applyMcuDisplayPrefs()
+                }
                 lastConnection = state
                 if (state is GlassesConnectionState.Disconnected) {
                     _imuDebug.value = "imu: disconnected"
                     promptedConnectMode = false
+                    promptedCalibration = false
                     mirrorHidesGrid = false
                     _promptConnectMode.value = false
+                    dismissCalibration()
                     setInputMode(InputMode.CONTROLS)
+                    steamVr.disconnect()
+                    showGrid()
+
                     clearAnchor()
                     stopMirroring()
                     browser.stop()
@@ -269,6 +311,18 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
         notesPanel.cursorY.set(0.5f)
         restorePrefs()
         rebuildIcons()
+        viewModelScope.launch {
+            var wasSteamVr = false
+            steamVr.ui.collect { ui ->
+                if (ui.connected && !wasSteamVr) {
+                    wasSteamVr = true
+                    onSteamVrConnected()
+                } else if (!ui.connected && wasSteamVr) {
+                    wasSteamVr = false
+                    onSteamVrDisconnected()
+                }
+            }
+        }
         browser.onImeFocus = { text ->
             _imeText.value = text
             _imeVisible.value = true
@@ -311,17 +365,104 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
 
     fun connect() {
         autoAnchored.set(false)
+        promptedCalibration = false
         clearAnchor()
         client.connect()
     }
 
     fun disconnect() = client.disconnect()
 
+    fun startCalibration(fromAuto: Boolean = false) {
+        val phase = _calibration.value.phase
+        if (phase == CalibrationPhase.HoldStill || phase == CalibrationPhase.Anchoring) return
+        calibrationJob?.cancel()
+        client.restartBiasCalibration()
+        autoAnchored.set(false)
+        _calibration.value = CalibrationUiState(
+            phase = CalibrationPhase.HoldStill,
+            progress = 0f,
+            message = if (fromAuto) {
+                "Connected — hold still while we measure gyro bias, then we’ll Anchor."
+            } else {
+                "Hold still ~1.5 s. Progress only advances while motion stays low."
+            },
+        )
+        appendLog(LogTags.IMU, "calibration started")
+        calibrationJob = viewModelScope.launch {
+            var stallMs = 0L
+            var lastProgress = 0f
+            while (isActive) {
+                val progress = client.biasProgress()
+                val rate = client.rateEmaDps()
+                _calibration.value = _calibration.value.copy(
+                    phase = CalibrationPhase.HoldStill,
+                    progress = progress,
+                    rateEmaDps = rate,
+                    message = when {
+                        rate > 5f -> "Too much motion — freeze your head."
+                        progress < 0.05f -> "Hold still… waiting for quiet samples."
+                        else -> "Hold still… ${(progress * 100).toInt()}%"
+                    },
+                )
+                if (progress >= 1f && client.biasReady()) {
+                    _calibration.value = CalibrationUiState(
+                        phase = CalibrationPhase.Anchoring,
+                        progress = 1f,
+                        message = "Look forward — planting world lock…",
+                    )
+                    delay(250)
+                    recenter()
+                    autoAnchored.set(true)
+                    val dz = client.gyroDeadzoneDps()
+                    val floor = client.noiseFloorDps()
+                    _calibration.value = CalibrationUiState(
+                        phase = CalibrationPhase.Done,
+                        progress = 1f,
+                        message = "Bias set, deadzone ${"%.1f".format(dz)}°/s " +
+                            "(floor ${"%.1f".format(floor)}°/s + 0.5°). " +
+                            "Slow looks should world-lock immediately.",
+                    )
+                    appendLog(
+                        LogTags.POSE,
+                        "calibration complete dz=${"%.2f".format(dz)} floor=${"%.2f".format(floor)}",
+                    )
+                    return@launch
+                }
+                if (kotlin.math.abs(progress - lastProgress) < 0.001f) {
+                    stallMs += 50
+                } else {
+                    stallMs = 0L
+                    lastProgress = progress
+                }
+                // Soft hint only — quiet-only warmup can sit at 0 while moving.
+                if (stallMs > 12_000L && progress < 0.2f) {
+                    _calibration.value = _calibration.value.copy(
+                        phase = CalibrationPhase.Failed,
+                        message = "Still seeing motion. Hold the glasses steady and retry.",
+                    )
+                    return@launch
+                }
+                delay(50)
+            }
+        }
+    }
+
+    fun dismissCalibration() {
+        calibrationJob?.cancel()
+        calibrationJob = null
+        _calibration.value = CalibrationUiState()
+    }
+
+    fun finishCalibration() {
+        dismissCalibration()
+    }
+
     fun recenter() {
         synchronized(poseLock) {
             worldLock.set(true)
         }
         _worldLocked.value = true
+        autoAnchored.set(true)
         client.recenter()
         displays.publishPose(Orientation.IDENTITY)
         displays.requestFrameNow()
@@ -458,6 +599,32 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
         persist()
     }
 
+    fun setBrightness(level: Int) {
+        val v = level.coerceIn(0, 7)
+        _brightness.value = v
+        persist()
+        // MCU USB deferred — do not touch iface 4 until connect is stable again.
+    }
+
+    private fun applyMcuDisplayPrefs() {
+        // no-op: MCU I/O disabled while restoring IMU connect
+    }
+
+    private fun onSteamVrConnected() {
+        if (stereoBeforeSteamVr == null) {
+            stereoBeforeSteamVr = _stereo.value
+        }
+        if (!_stereo.value) {
+            setStereo(true)
+        }
+    }
+
+    private fun onSteamVrDisconnected() {
+        val restore = stereoBeforeSteamVr ?: return
+        stereoBeforeSteamVr = null
+        setStereo(restore)
+    }
+
     fun setIpd(meters: Float) {
         val ipd = meters.coerceIn(StereoConfig.IPD_MIN, StereoConfig.IPD_MAX)
         _ipd.value = ipd
@@ -537,6 +704,7 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
         return when (focusedId.get()) {
             SCREEN -> if (mirror.enabled.get()) mirror.pose.get() else SpatialWindow()
             SpatialBrowser.ID -> browser.pose.get()
+            STEAMVR -> if (steamVrPipeline.enabled.get()) steamVrPipeline.pose.get() else SpatialWindow()
             else -> if (gridOpen.get()) windowRef.get() else focusedLayer().pose.get()
         }
     }
@@ -551,6 +719,7 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
         val ipd = prefs.ipdMeters()
         _stereo.value = stereo
         stereoFlag.set(stereo)
+        _brightness.value = prefs.brightness()
         _ipd.value = ipd
         ipdRef.set(ipd)
         _distance.value = prefs.distance()
@@ -570,6 +739,7 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
     private fun persist() {
         prefs.save(
             stereo = _stereo.value,
+            brightness = _brightness.value,
             ipdMeters = _ipd.value,
             distance = _distance.value,
             height = _panelHeight.value,
@@ -629,6 +799,10 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
 
     fun showGrid() {
         browser.cancelPointer()
+        // Home icons must not be covered by a leftover SteamVR immersive layer.
+        if (!steamVr.isConnected()) {
+            steamVr.clearGlassesLayer()
+        }
         gridOpen.set(true)
         focusedId.set(HOME)
         _focused.value = HOME
@@ -687,6 +861,11 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
             showGrid()
             return
         }
+        if (ShellApps.isSteamVr(component)) {
+            haptics.click()
+            openSteamVr()
+            return
+        }
         val web = WebApps.find(component)
         if (web == null) {
             appendLog(LogTags.UI, "unknown app $component")
@@ -694,6 +873,38 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
         }
         haptics.click()
         openBrowser(web.url)
+    }
+
+    fun openSteamVr() {
+        browser.cancelPointer()
+        collapseChrome()
+        if (steamVr.isConnected()) {
+            focus(STEAMVR)
+            gridOpen.set(false)
+            displays.requestFrameNow()
+            return
+        }
+        steamVr.openDialog()
+    }
+
+    fun closeSteamVrDialog() = steamVr.closeDialog()
+    fun selectSteamVrHost(host: XrHost) = steamVr.select(host)
+    fun setSteamVrIp(ip: String) = steamVr.setManualIp(ip)
+    fun setSteamVrHeight(m: Float) = steamVr.setHeight(m)
+    fun connectSteamVr() {
+        steamVr.connect()
+        viewModelScope.launch {
+            val state = steamVr.ui.first { !it.busy }
+            if (state.connected) {
+                gridOpen.set(false)
+                focus(STEAMVR)
+                displays.requestFrameNow()
+            }
+        }
+    }
+    fun disconnectSteamVr() {
+        steamVr.disconnect()
+        showGrid()
     }
 
     fun closeBrowser() {
@@ -705,6 +916,7 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
         when (focusedId.get()) {
             SpatialBrowser.ID -> browser.stop()
             SCREEN -> stopMirroring()
+            STEAMVR -> steamVr.disconnect()
         }
         collapseChrome()
         val remaining = windowList()
@@ -737,10 +949,10 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
         for (component in order) {
             val shell = ShellApps.catalog.firstOrNull { it.component == component }
             if (shell != null) {
-                val bmp = if (ShellApps.isScreen(shell.component)) {
-                    BrandIcons.screenMirror()
-                } else {
-                    BrandIcons.extendedDisplay()
+                val bmp = when {
+                    ShellApps.isScreen(shell.component) -> BrandIcons.screenMirror()
+                    ShellApps.isSteamVr(shell.component) -> BrandIcons.steamVr()
+                    else -> BrandIcons.extendedDisplay()
                 }
                 apps += IconSource(shell.component, bmp, name = shell.name)
                 continue
@@ -1210,12 +1422,14 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
         return buildList {
             if (browser.running) add(SpatialBrowser.ID to browser.pose.get())
             if (mirror.enabled.get()) add(SCREEN to mirror.pose.get())
+            if (steamVrPipeline.enabled.get()) add(STEAMVR to steamVrPipeline.pose.get())
         }
     }
 
     private fun windowOf(id: String): SpatialWindow? {
         if (id == SCREEN) return if (mirror.enabled.get()) mirror.pose.get() else null
         if (id == SpatialBrowser.ID) return if (browser.running) browser.pose.get() else null
+        if (id == STEAMVR) return if (steamVrPipeline.enabled.get()) steamVrPipeline.pose.get() else null
         return layers.firstOrNull { it.id == id }?.pose?.get()
     }
 
@@ -1359,6 +1573,7 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
         setPointerAiming(false)
         stopMirroring()
         browser.stop()
+        steamVr.disconnect()
         phonePointer?.stop()
         phonePointer = null
         pointerBeam.set(PointerBeam(0f, 0f, -2f, false))
@@ -1373,6 +1588,7 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
         const val HOME = "home"
         const val NOTES = "notes"
         const val SCREEN = MirrorPipeline.ID
+        const val STEAMVR = MirrorPipeline.STEAMVR_ID
         const val BROWSER = SpatialBrowser.ID
     }
 }

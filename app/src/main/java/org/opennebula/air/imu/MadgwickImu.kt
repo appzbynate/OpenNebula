@@ -217,6 +217,42 @@ class MadgwickImu {
 
     fun biasReady(): Boolean = synchronized(lock) { warmupN >= WARMUP_SAMPLES }
 
+    /** Calib UI progress 0..1 (baseline fusion; API kept for guided Calibrate). */
+    fun biasProgress(): Float = synchronized(lock) {
+        (warmupN.toFloat() / WARMUP_SAMPLES.toFloat()).coerceIn(0f, 1f)
+    }
+
+    fun gyroDeadzoneDps(): Float = REST_DEADZONE_DPS
+
+    fun noiseFloorDps(): Float = synchronized(lock) {
+        if (warmupN <= 0) return@synchronized 0f
+        // Approx from bias magnitude after quiet warmup (baseline has no mag ring).
+        val bx = Math.toDegrees(biasX.toDouble()).toFloat()
+        val by = Math.toDegrees(biasY.toDouble()).toFloat()
+        val bz = Math.toDegrees(biasZ.toDouble()).toFloat()
+        sqrt(bx * bx + by * by + bz * bz)
+    }
+
+    /** Restart quiet warmup for guided calibration (does not change fusion math). */
+    fun restartBiasCalibration() {
+        synchronized(lock) {
+            warmupN = 0
+            warmupSumX = 0f
+            warmupSumY = 0f
+            warmupSumZ = 0f
+            biasX = 0f
+            biasY = 0f
+            biasZ = 0f
+            offsetTimer = 0
+            stillSamples = 0
+            restEnterCount = 0
+            restExitCount = 0
+            restFrozen = true
+            rateEmaDps = 0f
+            lastKp = 0f
+        }
+    }
+
     fun biasLogLine(): String = synchronized(lock) {
         val b = residualBiasDps()
         val corrDps = Vec3f(

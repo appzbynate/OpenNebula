@@ -42,8 +42,13 @@ class IconGridTest {
     }
 
     @Test
-    fun four_count_rows_are_wider_than_six() {
-        assertTrue(IconGrid.gapX(4) > IconGrid.gapX(6))
+    fun all_rows_use_the_same_horizontal_gap() {
+        assertEquals(IconGrid.GAP_X, IconGrid.gapX(4), 0f)
+        assertEquals(IconGrid.GAP_X, IconGrid.gapX(6), 0f)
+        val pitch4 = IconGrid.localX(1, 4) - IconGrid.localX(0, 4)
+        val pitch6 = IconGrid.localX(1, 6) - IconGrid.localX(0, 6)
+        assertEquals(IconGrid.FACE + IconGrid.GAP_X, pitch4, 1e-4f)
+        assertEquals(pitch4, pitch6, 1e-4f)
     }
 
     @Test
@@ -120,8 +125,7 @@ class IconGridTest {
 
     @Test
     fun icons_have_breathing_room() {
-        assertTrue(IconGrid.GAP_X_TIGHT >= 0.06f)
-        assertTrue(IconGrid.GAP_X_WIDE > IconGrid.GAP_X_TIGHT)
+        assertTrue(IconGrid.GAP_X >= 0.06f)
         assertTrue(IconGrid.GAP_Y >= 0.06f)
         val gap = IconGrid.gapX(6)
         assertTrue(gap / IconGrid.FACE >= 0.45f)
@@ -139,9 +143,11 @@ class IconGridTest {
         val apps = (0 until 20).map { IconSource("app$it", null) }
         val tiles = IconGrid.sprites(apps, page = 0, pan = 0f, field = field)
         val lowestBottom = tiles.minOf { it.pose.y - IconGrid.FACE / 2f }
-        val expected = SpatialLayout.FLOOR_Y + IconGrid.FACE + IconGrid.GAP_Y
+        val rowPitch = IconGrid.cellHeight() + IconGrid.GAP_Y
+        val expected = SpatialLayout.FLOOR_Y + IconGrid.FACE + IconGrid.GAP_Y + 2f * rowPitch
         assertEquals(expected, lowestBottom, 0.03f)
-        assertTrue(lowestBottom < -0.5f)
+        assertTrue(lowestBottom < 0f)
+        assertTrue(lowestBottom > SpatialLayout.FLOOR_Y + 0.2f)
     }
 
     @Test

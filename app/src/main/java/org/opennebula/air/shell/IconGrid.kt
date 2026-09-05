@@ -45,8 +45,10 @@ object IconGrid {
     const val LABEL_H = 0.048f
     const val ICON_LABEL_GAP = 0.014f
     const val GAP_Y = 0.072f
-    const val GAP_X_WIDE = 0.16f
-    const val GAP_X_TIGHT = 0.072f
+    /** Same horizontal pitch on every row (was tight on 6-wide middle rows). */
+    const val GAP_X = 0.16f
+    const val GAP_X_WIDE = GAP_X
+    const val GAP_X_TIGHT = GAP_X
     const val PAGE_GAP = 0.55f
     const val THICKNESS = 0.016f
     const val PARALLAX = 0.010f
@@ -71,13 +73,13 @@ object IconGrid {
         return null
     }
 
-    fun gapX(count: Int): Float = if (count <= 4) GAP_X_WIDE else GAP_X_TIGHT
+    fun gapX(count: Int): Float = GAP_X
 
     fun cellHeight(): Float = FACE + ICON_LABEL_GAP + LABEL_H
 
     fun pageStride(): Float = fieldWidth() + PAGE_GAP
 
-    fun fieldWidth(): Float = 6 * FACE + 5 * GAP_X_TIGHT
+    fun fieldWidth(): Float = 6 * FACE + 5 * GAP_X
 
     fun fieldHeight(): Float = 4 * cellHeight() + 3 * GAP_Y
 
@@ -127,11 +129,12 @@ object IconGrid {
         return cellY + (cell / 2f - FACE / 2f)
     }
 
-    /** Field center Y so the bottom icons sit one empty row above the floor. */
+    /** Field center Y: bottom icons sit *three* empty rows above the floor. */
     fun fieldY(floorY: Float = SpatialLayout.FLOOR_Y): Float {
         val last = ROWS.lastIndex
         val bottomCenter = localY(last)
-        val desired = floorY + FACE / 2f + FACE + GAP_Y
+        val rowPitch = cellHeight() + GAP_Y
+        val desired = floorY + FACE / 2f + FACE + GAP_Y + 2f * rowPitch
         return desired - bottomCenter
     }
 

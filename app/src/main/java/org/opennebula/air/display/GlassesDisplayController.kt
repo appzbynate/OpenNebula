@@ -41,6 +41,7 @@ class GlassesDisplayController(
     private val gridOpen: AtomicBoolean,
     private val gridPose: AtomicReference<SpatialWindow>,
     private val browser: MirrorPipeline,
+    private val steamVr: MirrorPipeline,
     private val onLog: (tag: String, message: String) -> Unit,
 ) {
     private val main = Handler(Looper.getMainLooper())
@@ -138,6 +139,7 @@ class GlassesDisplayController(
             gridOpen,
             gridPose,
             browser,
+            steamVr,
         )
         runCatching {
             next.show()

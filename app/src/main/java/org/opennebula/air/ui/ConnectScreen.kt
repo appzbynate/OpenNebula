@@ -21,6 +21,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -68,6 +69,7 @@ fun ConnectScreen(viewModel: GlassesViewModel) {
     val imuDebug by viewModel.imuDebug.collectAsStateWithLifecycle()
     val worldLocked by viewModel.worldLocked.collectAsStateWithLifecycle()
     val stereo by viewModel.stereo.collectAsStateWithLifecycle()
+    val brightness by viewModel.brightness.collectAsStateWithLifecycle()
     val moveScreen by viewModel.moveScreen.collectAsStateWithLifecycle()
     val focused by viewModel.focused.collectAsStateWithLifecycle()
     val inputMode by viewModel.inputMode.collectAsStateWithLifecycle()
@@ -77,6 +79,8 @@ fun ConnectScreen(viewModel: GlassesViewModel) {
     val imeText by viewModel.imeText.collectAsStateWithLifecycle()
     val promptConnectMode by viewModel.promptConnectMode.collectAsStateWithLifecycle()
     val pinnedIds by viewModel.pinnedIds.collectAsStateWithLifecycle()
+    val calibration by viewModel.calibration.collectAsStateWithLifecycle()
+    val steamVr by viewModel.steamVrUi.collectAsStateWithLifecycle()
     var showSettings by remember { mutableStateOf(false) }
     var showApps by remember { mutableStateOf(false) }
     Box(Modifier.fillMaxSize()) {
@@ -86,6 +90,7 @@ fun ConnectScreen(viewModel: GlassesViewModel) {
             presenting = displayStatus.presenting,
             worldLocked = worldLocked,
             stereo = stereo,
+            brightness = brightness,
             mirroring = mirroring,
             moveScreen = moveScreen,
             focused = focused,
@@ -99,7 +104,9 @@ fun ConnectScreen(viewModel: GlassesViewModel) {
             onConnect = viewModel::connect,
             onDisconnect = viewModel::disconnect,
             onAnchorOrRecenter = viewModel::recenter,
+            onCalibrate = { viewModel.startCalibration(fromAuto = false) },
             onStereo = viewModel::setStereo,
+            onBrightness = viewModel::setBrightness,
             onMirroring = viewModel::setMirroring,
             onFocus = viewModel::focus,
             onClear = viewModel::clearLogs,
@@ -141,6 +148,25 @@ fun ConnectScreen(viewModel: GlassesViewModel) {
                 shortcuts = ConnectMode.extendShortcuts(pinnedIds),
                 onMirror = viewModel::chooseMirror,
                 onExtend = viewModel::chooseExtend,
+            )
+        }
+        if (calibration.phase != CalibrationPhase.Hidden) {
+            CalibrationDialog(
+                state = calibration,
+                onDismiss = viewModel::dismissCalibration,
+                onRetry = { viewModel.startCalibration(fromAuto = false) },
+                onFinish = viewModel::finishCalibration,
+            )
+        }
+        if (steamVr.open) {
+            SteamVrDialog(
+                state = steamVr,
+                onSelect = viewModel::selectSteamVrHost,
+                onManualIp = viewModel::setSteamVrIp,
+                onHeight = viewModel::setSteamVrHeight,
+                onConnect = viewModel::connectSteamVr,
+                onDisconnect = viewModel::disconnectSteamVr,
+                onClose = viewModel::closeSteamVrDialog,
             )
         }
         if (inputMode != InputMode.CONTROLS && !promptConnectMode) {
@@ -187,6 +213,7 @@ fun ConnectScreenContent(
     presenting: Boolean,
     worldLocked: Boolean,
     stereo: Boolean,
+    brightness: Int,
     mirroring: Boolean,
     moveScreen: Boolean,
     focused: String,
@@ -200,7 +227,9 @@ fun ConnectScreenContent(
     onConnect: () -> Unit,
     onDisconnect: () -> Unit,
     onAnchorOrRecenter: () -> Unit,
+    onCalibrate: () -> Unit,
     onStereo: (Boolean) -> Unit,
+    onBrightness: (Int) -> Unit,
     onMirroring: (Boolean) -> Unit,
     onFocus: (String) -> Unit,
     onClear: () -> Unit,
@@ -228,6 +257,9 @@ fun ConnectScreenContent(
     val connected = state is GlassesConnectionState.Streaming ||
         state is GlassesConnectionState.Connecting ||
         state is GlassesConnectionState.AwaitingPermission
+    // Only treat live IMU as "connected" for Connect/Disconnect — permission/connecting
+    // used to hide Connect Glasses and leave the UI stuck.
+    val streaming = state is GlassesConnectionState.Streaming
 
     Scaffold { padding ->
         Column(
@@ -241,9 +273,9 @@ fun ConnectScreenContent(
             Text("OpenNebula", style = MaterialTheme.typography.titleLarge)
             Text(
                 when {
-                    !connected -> "Connect the Air. The scene stays glued to the visor until you tap Anchor."
-                    !worldLocked -> "Glued to the visor. Look forward and tap Anchor."
-                    else -> "Phone = trackpad or pointer. Glasses = floating apps."
+                    !connected -> "Connect the Air. You’ll get a hold-still calibration, then Anchor."
+                    !worldLocked -> "Hold still for Calibrate, or look forward and tap Anchor."
+                    else -> "Phone = trackpad or pointer. Glasses = floating apps. Calibrate if icons crawl."
                 },
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.secondary,
@@ -272,12 +304,22 @@ fun ConnectScreenContent(
             ) {
                 Switch(checked = stereo, onCheckedChange = onStereo)
                 Text(
-                    if (stereo) "Stereo SBS — dual-eye cameras. Press the glasses arm button for 3D hardware mode."
+                    if (stereo) "Stereo SBS — OpenNebula sets hardware 3D automatically."
                     else "Mono — single camera",
                     style = MaterialTheme.typography.bodyMedium,
                     modifier = Modifier.weight(1f),
                 )
             }
+            Text(
+                "Brightness $brightness / 7",
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Slider(
+                value = brightness.toFloat(),
+                onValueChange = { onBrightness(it.toInt()) },
+                valueRange = 0f..7f,
+                steps = 6,
+            )
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -301,10 +343,14 @@ fun ConnectScreenContent(
                 ) { Text("Screen") }
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                if (connected) {
+                if (streaming) {
                     Button(onClick = onDisconnect) { Text("Disconnect") }
+                    Button(onClick = onCalibrate) { Text("Calibrate") }
                 } else {
                     Button(onClick = onConnect) { Text("Connect Glasses") }
+                    if (connected) {
+                        Button(onClick = onDisconnect) { Text("Cancel") }
+                    }
                 }
                 OutlinedButton(onClick = onToggleLog) { Text(if (showLog) "Hide log" else "Log") }
                 OutlinedButton(onClick = onCycleAxis) { Text("Axis") }
@@ -498,9 +544,9 @@ private fun fingersFrom(event: MotionEvent, skipIndex: Int = -1): List<TrackpadF
 }
 
 private fun statusText(state: GlassesConnectionState): String = when (state) {
-    GlassesConnectionState.Disconnected -> "Status: disconnected"
+    GlassesConnectionState.Disconnected -> "Status: disconnected — plug glasses in, then Connect"
     GlassesConnectionState.Connecting -> "Status: connecting…"
-    GlassesConnectionState.AwaitingPermission -> "Status: waiting for USB permission"
+    GlassesConnectionState.AwaitingPermission -> "Status: waiting for USB permission — tap Allow"
     is GlassesConnectionState.Streaming ->
         "Status: streaming ${state.packetsPerSec} Hz"
 }

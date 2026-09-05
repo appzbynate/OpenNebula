@@ -34,12 +34,13 @@ object IconSculpt {
     )
 
     enum class Glyph {
-        SCREEN, EXTENDED, YOUTUBE, PARSEC, TWITCH, DISCORD,
+        SCREEN, EXTENDED, STEAMVR, YOUTUBE, PARSEC, TWITCH, DISCORD,
         SPOTIFY, REDDIT, XBOX, CHATGPT, PLEX, GOOGLE, LETTER,
     }
 
     fun screen(): Bitmap = bitmap(Spec(0.22f, 0.86f, 0.78f, 0.52f, 0.46f, 0.07f, Glyph.SCREEN))
     fun extended(): Bitmap = bitmap(Spec(0.45f, 0.70f, 0.98f, 0.54f, 0.40f, 0.07f, Glyph.EXTENDED))
+    fun steamVr(): Bitmap = bitmap(Spec(0.10f, 0.12f, 0.16f, 0.54f, 0.40f, 0.07f, Glyph.STEAMVR))
 
     fun web(item: WebAppItem): Bitmap {
         val c = item.color
@@ -297,6 +298,16 @@ object IconSculpt {
                 val front = RectF(cx - s * 0.10f, cy - s * 0.08f, cx + s * 0.34f, cy + s * 0.28f)
                 canvas.drawRoundRect(back, s * 0.06f, s * 0.06f, stroke)
                 canvas.drawRoundRect(front, s * 0.06f, s * 0.06f, stroke)
+            }
+            Glyph.STEAMVR -> {
+                // Steam-like circle + VR bars (not trademarked wordmark).
+                canvas.drawCircle(cx - s * 0.12f, cy + s * 0.06f, s * 0.28f, stroke)
+                canvas.drawCircle(cx + s * 0.18f, cy - s * 0.10f, s * 0.16f, stroke)
+                canvas.drawLine(cx - s * 0.12f, cy + s * 0.06f, cx + s * 0.18f, cy - s * 0.10f, stroke)
+                canvas.drawCircle(cx - s * 0.12f, cy + s * 0.06f, s * 0.10f, fill)
+                val bar = Paint(fill).apply { strokeWidth = size * 0.045f; style = Paint.Style.STROKE }
+                canvas.drawLine(cx - s * 0.34f, cy - s * 0.34f, cx - s * 0.10f, cy - s * 0.34f, bar)
+                canvas.drawLine(cx + s * 0.06f, cy - s * 0.34f, cx + s * 0.34f, cy - s * 0.34f, bar)
             }
             Glyph.PARSEC -> {
                 val pad = RectF(cx - s * 0.38f, cy - s * 0.20f, cx + s * 0.38f, cy + s * 0.20f)

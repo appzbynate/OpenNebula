@@ -8,6 +8,8 @@ class DisplayPrefs(context: Context) {
 
     fun stereo(): Boolean = prefs.getBoolean(STEREO, true)
 
+    fun brightness(): Int = prefs.getInt(BRIGHTNESS, 5).coerceIn(0, 7)
+
     fun ipdMeters(): Float = prefs.getFloat(IPD, StereoConfig.IPD_METERS)
         .coerceIn(StereoConfig.IPD_MIN, StereoConfig.IPD_MAX)
 
@@ -25,6 +27,7 @@ class DisplayPrefs(context: Context) {
 
     fun save(
         stereo: Boolean,
+        brightness: Int,
         ipdMeters: Float,
         distance: Float,
         height: Float,
@@ -33,6 +36,7 @@ class DisplayPrefs(context: Context) {
     ) {
         prefs.edit()
             .putBoolean(STEREO, stereo)
+            .putInt(BRIGHTNESS, brightness.coerceIn(0, 7))
             .putFloat(IPD, ipdMeters)
             .putFloat(DIST, distance)
             .putFloat(HEIGHT, height)
@@ -44,6 +48,7 @@ class DisplayPrefs(context: Context) {
     companion object {
         private const val NAME = "opennebula_display"
         private const val STEREO = "stereo"
+        private const val BRIGHTNESS = "brightness"
         private const val IPD = "ipd"
         // v2 invalidates old 2.35 m defaults so the new farther layout applies once.
         private const val DIST = "distance_v2"

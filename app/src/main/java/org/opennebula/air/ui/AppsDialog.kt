@@ -103,7 +103,11 @@ fun AppsDialog(
                         val on = item.component in pinSet
                         AppRow(
                             name = item.name,
-                            detail = if (ShellApps.isScreen(item.component)) "Phone mirror" else "App grid",
+                            detail = when {
+                                ShellApps.isScreen(item.component) -> "Phone mirror"
+                                ShellApps.isSteamVr(item.component) -> "PC SteamVR bridge"
+                                else -> "App grid"
+                            },
                             pinned = on,
                             onToggle = { viewModel.setIconPinned(item.component, !on) },
                         )

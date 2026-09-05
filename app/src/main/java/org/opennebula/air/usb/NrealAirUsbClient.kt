@@ -72,6 +72,17 @@ class NrealAirUsbClient(
 
     fun lastGyroRadS(): Vec3f = fusion.lastGyroRadS()
     fun biasReady(): Boolean = fusion.biasReady()
+    fun biasProgress(): Float = fusion.biasProgress()
+    fun rateEmaDps(): Float = fusion.rateEmaDps()
+    fun gyroDeadzoneDps(): Float = fusion.gyroDeadzoneDps()
+    fun noiseFloorDps(): Float = fusion.noiseFloorDps()
+
+    fun restartBiasCalibration() {
+        fusion.restartBiasCalibration()
+        poseEpoch.incrementAndGet()
+        emit(LogTags.IMU, "bias calibration restarted — hold still")
+    }
+
     fun cycleImuAxisMode(): String {
         ImuParser.resetAirAxisMode()
         return ImuParser.AIR_AXIS_LABEL
@@ -83,14 +94,23 @@ class NrealAirUsbClient(
     private var readerExecutor: ExecutorService? = null
     private var connection: UsbDeviceConnection? = null
     private var claimedInterface: UsbInterface? = null
+    private var pendingDetachJob: Job? = null
     @Volatile private var readerRunning = false
 
     fun connect() {
         scope.launch(Dispatchers.IO) {
+            pendingDetachJob?.cancel()
+            pendingDetachJob = null
             mutex.withLock {
-                if (_state.value !is GlassesConnectionState.Disconnected) {
-                    emit(LogTags.USB, "Connect ignored: already ${_state.value}")
+                val cur = _state.value
+                if (cur is GlassesConnectionState.Streaming && connection != null && readerRunning) {
+                    emit(LogTags.USB, "Connect ignored: already streaming")
                     return@withLock
+                }
+                // Re-open from permission/connecting/stale streaming after USB re-enumerate.
+                if (cur !is GlassesConnectionState.Disconnected) {
+                    emit(LogTags.USB, "Connect reopen from $cur")
+                    closeLocked("reconnect")
                 }
                 _state.value = GlassesConnectionState.Connecting
             }
@@ -229,9 +249,17 @@ class NrealAirUsbClient(
                     if (intent.action != UsbManager.ACTION_USB_DEVICE_DETACHED) return
                     val device = extraDevice(intent) ?: return
                     if (!isNrealAir(device)) return
-                    emit(LogTags.USB, "USB detached")
-                    scope.launch(Dispatchers.IO) {
+                    emit(LogTags.USB, "USB detached — debounce (composite re-enum is common)")
+                    pendingDetachJob?.cancel()
+                    pendingDetachJob = scope.launch {
+                        kotlinx.coroutines.delay(DETACH_DEBOUNCE_MS)
                         mutex.withLock { closeLocked("detached") }
+                        // Re-enumeration often completes without a second ATTACHED delivery.
+                        kotlinx.coroutines.delay(200)
+                        if (_state.value is GlassesConnectionState.Disconnected && findAir() != null) {
+                            emit(LogTags.USB, "Air still present after detach — reconnecting")
+                            connect()
+                        }
                     }
                 }
             }
@@ -269,6 +297,8 @@ class NrealAirUsbClient(
 
     private suspend fun openAndStream(device: UsbDevice) {
         mutex.withLock {
+            pendingDetachJob?.cancel()
+            pendingDetachJob = null
             closeLocked("reopen")
             try {
                 val conn = usbManager.openDevice(device)
@@ -301,6 +331,11 @@ class NrealAirUsbClient(
         }
     }
 
+    /**
+     * Pre-button claim path (baseline 0.8.92 / working 0.9.x): prefer IMU (3), then MCU (4),
+     * then any interrupt/bulk-IN interface. First successful force-claim wins.
+     * Do not require iface 3 only — that broke units where the IMU IN endpoint isn't on 3.
+     */
     private fun claimImuInterface(
         device: UsbDevice,
         conn: UsbDeviceConnection,
@@ -330,6 +365,21 @@ class NrealAirUsbClient(
         }
         emit(LogTags.USB, "No HID interrupt-IN interface could be claimed")
         return null
+    }
+
+    /** MCU I/O still disabled — brightness/3D later. */
+    fun getBrightness(): Int? = null
+
+    fun setBrightness(level: Int): Boolean {
+        emit(LogTags.USB, "MCU brightness deferred level=$level")
+        return false
+    }
+
+    fun getDisplayMode(): Int? = null
+
+    fun setDisplayMode3d(enabled: Boolean): Boolean {
+        emit(LogTags.USB, "MCU display mode deferred 3d=$enabled")
+        return false
     }
 
     private fun findEndpoint(iface: UsbInterface, direction: Int): UsbEndpoint? {
@@ -665,6 +715,7 @@ class NrealAirUsbClient(
 
     companion object {
         const val ACTION_USB_PERMISSION = "org.opennebula.air.USB_PERMISSION"
+        private const val DETACH_DEBOUNCE_MS = 600L
         private const val HUD_PERIOD_MS = 50L // 20 Hz phone HUD
         private const val UI_PERIOD_MS = 200L // 5 Hz log lines
         private const val USB_HID_SET_REPORT_TYPE = 0x21
