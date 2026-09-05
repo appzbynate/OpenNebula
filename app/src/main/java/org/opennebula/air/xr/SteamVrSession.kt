@@ -24,7 +24,7 @@ data class SteamVrUiState(
     val hosts: List<XrHost> = emptyList(),
     val selected: XrHost? = null,
     val manualIp: String = "",
-    val heightM: Float = 1.60f,
+    val heightM: Float = 1.75f,
     val status: String = "On your PC run:  tools\\xr-bridge\\start_bridge.bat",
     val connected: Boolean = false,
     val busy: Boolean = false,
@@ -51,7 +51,9 @@ class SteamVrSession(
         onHosts = { list -> _ui.value = _ui.value.copy(hosts = list) },
         onLog = onLog,
     )
-    private val pose = XrPoseStreamer().also { it.onLog = onLog }
+    private val pose = XrPoseStreamer(
+        diagDir = java.io.File(appContext.getExternalFilesDir(null), "diag"),
+    ).also { it.onLog = onLog }
     private val video = XrVideoClient(
         scope = scope,
         pipeline = pipeline,

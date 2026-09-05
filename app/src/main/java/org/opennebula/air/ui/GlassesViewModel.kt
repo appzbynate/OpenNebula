@@ -96,7 +96,9 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
         SpatialLayer(NOTES, "Notes", notesPanel, notesPose),
     )
     val markerFlag = AtomicReference(false)
-    val stereoFlag = AtomicBoolean(true)
+    val stereoFlag = AtomicBoolean(false)
+    /** True after MCU HalfSBS mode is applied — drives eye projection aspect. */
+    val hardware3dFlag = AtomicBoolean(false)
     val ipdRef = AtomicReference(StereoConfig.IPD_METERS)
     val pointerBeam = AtomicReference(PointerBeam(0f, 0f, -2f, false))
     val mirror = MirrorPipeline()
@@ -147,6 +149,7 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
         focusedId = focusedId,
         showMarkers = markerFlag,
         stereoEnabled = stereoFlag,
+        hardware3d = hardware3dFlag,
         ipdMeters = ipdRef,
         pointerBeam = pointerBeam,
         mirror = mirror,
@@ -188,7 +191,7 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
     private val _calibration = MutableStateFlow(CalibrationUiState())
     val calibration: StateFlow<CalibrationUiState> = _calibration.asStateFlow()
 
-    private val _stereo = MutableStateFlow(true)
+    private val _stereo = MutableStateFlow(false)
     val stereo: StateFlow<Boolean> = _stereo.asStateFlow()
     private val _brightness = MutableStateFlow(5)
     val brightness: StateFlow<Int> = _brightness.asStateFlow()
@@ -594,9 +597,26 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
     fun setStereo(enabled: Boolean) {
         _stereo.value = enabled
         stereoFlag.set(enabled)
+        if (!enabled) {
+            hardware3dFlag.set(false)
+        } else {
+            // Projection path on immediately; MCU confirm keeps or clears the flag.
+            hardware3dFlag.set(true)
+        }
         displays.refreshModeStatus()
         displays.requestFrameNow()
         persist()
+        viewModelScope.launch(Dispatchers.IO) {
+            val ok = runCatching { client.setDisplayMode3d(enabled) }.getOrDefault(false)
+            hardware3dFlag.set(enabled && ok)
+            displays.refreshModeStatus()
+            displays.requestFrameNow()
+            appendLog(
+                LogTags.USB,
+                if (ok) "hardware ${if (enabled) "3D SBS" else "2D"} applied"
+                else "hardware display mode failed (software stereo still ${if (enabled) "on" else "off"})",
+            )
+        }
     }
 
     fun setBrightness(level: Int) {
@@ -606,17 +626,53 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
         // MCU USB deferred — do not touch iface 4 until connect is stable again.
     }
 
+    /** Always boot the session in 2D; user toggles hardware 3D explicitly. */
     private fun applyMcuDisplayPrefs() {
-        // no-op: MCU I/O disabled while restoring IMU connect
+        _stereo.value = false
+        stereoFlag.set(false)
+        hardware3dFlag.set(false)
+        displays.refreshModeStatus()
+        displays.requestFrameNow()
+        persist()
+        viewModelScope.launch(Dispatchers.IO) {
+            val ok = runCatching { client.setDisplayMode3d(false) }.getOrDefault(false)
+            appendLog(
+                LogTags.USB,
+                if (ok) "connect → hardware 2D"
+                else "connect → hardware 2D request failed (UI stays 2D)",
+            )
+        }
     }
 
-    private fun onSteamVrConnected() {
+    /** SteamVR: ultrawide SBS (MCU mode 3 = 3840×1080 → 1920/eye). */
+    private fun forceSteamVrHardware3d() {
         if (stereoBeforeSteamVr == null) {
             stereoBeforeSteamVr = _stereo.value
         }
-        if (!_stereo.value) {
-            setStereo(true)
+        _stereo.value = true
+        stereoFlag.set(true)
+        hardware3dFlag.set(true)
+        displays.refreshModeStatus()
+        displays.requestFrameNow()
+        persist()
+        viewModelScope.launch(Dispatchers.IO) {
+            val ok = runCatching {
+                client.setDisplayMode3d(enabled = true, ultrawide = true)
+            }.getOrDefault(false)
+            hardware3dFlag.set(ok)
+            displays.refreshModeStatus()
+            displays.requestFrameNow()
+            appendLog(
+                LogTags.USB,
+                if (ok) "SteamVR → hardware ultrawide 3D SBS (mode 3/8)"
+                else "SteamVR → hardware 3D failed",
+            )
         }
+    }
+
+    private fun onSteamVrConnected() {
+        // Broken physical 3D button — force MCU SBS when SteamVR loads.
+        forceSteamVrHardware3d()
     }
 
     private fun onSteamVrDisconnected() {
@@ -715,10 +771,11 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
     }
 
     private fun restorePrefs() {
-        val stereo = prefs.stereo()
+        // Session always starts in 2D; user must toggle hardware 3D.
+        _stereo.value = false
+        stereoFlag.set(false)
+        hardware3dFlag.set(false)
         val ipd = prefs.ipdMeters()
-        _stereo.value = stereo
-        stereoFlag.set(stereo)
         _brightness.value = prefs.brightness()
         _ipd.value = ipd
         ipdRef.set(ipd)
@@ -892,6 +949,8 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
     fun setSteamVrIp(ip: String) = steamVr.setManualIp(ip)
     fun setSteamVrHeight(m: Float) = steamVr.setHeight(m)
     fun connectSteamVr() {
+        // Force glasses ultrawide SBS before video (physical 3D button is broken).
+        forceSteamVrHardware3d()
         steamVr.connect()
         viewModelScope.launch {
             val state = steamVr.ui.first { !it.busy }

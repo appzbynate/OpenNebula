@@ -70,14 +70,14 @@ fun SettingsDialog(
                 ) {
                     Switch(checked = stereo, onCheckedChange = viewModel::setStereo)
                     Text(
-                        if (stereo) "Stereo SBS — OpenNebula sets hardware 3D automatically."
-                        else "Mono — single camera",
+                        if (stereo) "Hardware 3D SBS — toggle off for 2D."
+                        else "2D mirror — toggle on for hardware 3D.",
                         style = MaterialTheme.typography.bodyMedium,
                         modifier = Modifier.weight(1f),
                     )
                 }
                 val brightness by viewModel.brightness.collectAsStateWithLifecycle()
-                Text("Brightness $brightness / 7", fontSize = 13.sp)
+                Text("Brightness $brightness / 7 (MCU later)", fontSize = 13.sp)
                 Slider(
                     value = brightness.toFloat(),
                     onValueChange = { viewModel.setBrightness(it.toInt()) },

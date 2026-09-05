@@ -14,14 +14,21 @@ import java.util.concurrent.atomic.AtomicReference
  * High-rate head pose uplink to the PC companion (SteamVR / OpenTrack).
  * Packet: magic u32 LE 'ONXR', seq u32, t_ns i64, qw..qz f32,
  * yawDeg, pitchDeg, rollDeg f32, heightM f32.
+ *
+ * Also appends a low-rate CSV under files/diag/pose_steamvr.csv while running
+ * so we can compare phone euler vs what the PC FreeTrack log shows.
  */
-class XrPoseStreamer {
+class XrPoseStreamer(
+    private val diagDir: java.io.File? = null,
+) {
     private val running = AtomicBoolean(false)
     private val seq = AtomicInteger(0)
     private val target = AtomicReference<Pair<InetAddress, Int>?>(null)
     private var socket: DatagramSocket? = null
-    @Volatile var heightM: Float = 1.6f
+    @Volatile var heightM: Float = 1.75f
     @Volatile var onLog: ((String) -> Unit)? = null
+    private var lastDiagMs = 0L
+    private var diagHeaderWritten = false
 
     fun start(address: String, port: Int = XrBridgeProtocol.POSE_PORT) {
         stop()
@@ -29,6 +36,7 @@ class XrPoseStreamer {
         target.set(addr to port)
         socket = DatagramSocket()
         running.set(true)
+        diagHeaderWritten = false
         onLog?.invoke("pose → $address:$port")
     }
 
@@ -60,5 +68,27 @@ class XrPoseStreamer {
         buf.putFloat(heightM)
         val packet = DatagramPacket(buf.array(), buf.position(), dest.first, dest.second)
         runCatching { sock.send(packet) }
+        maybeDiag(pose)
+    }
+
+    private fun maybeDiag(pose: Orientation) {
+        val dir = diagDir ?: return
+        val now = System.currentTimeMillis()
+        if (now - lastDiagMs < 100L) return
+        lastDiagMs = now
+        runCatching {
+            dir.mkdirs()
+            val f = java.io.File(dir, "pose_steamvr.csv")
+            if (!diagHeaderWritten || !f.exists()) {
+                f.writeText("t_ms,yaw,pitch,roll,qw,qx,qy,qz\n")
+                diagHeaderWritten = true
+            }
+            f.appendText(
+                "$now,${"%.3f".format(pose.yawDeg)},${"%.3f".format(pose.pitchDeg)}," +
+                    "${"%.3f".format(pose.rollDeg)}," +
+                    "${"%.4f".format(pose.qw)},${"%.4f".format(pose.qx)}," +
+                    "${"%.4f".format(pose.qy)},${"%.4f".format(pose.qz)}\n",
+            )
+        }
     }
 }

@@ -127,26 +127,30 @@ class MirrorPipeline {
         }
     }
 
-    /** Software frame path (XR bridge MJPEG). Recycles the source bitmap. */
+    /**
+     * Software frame path (XR bridge MJPEG).
+     * Takes ownership of [src] when mutable ARGB — skips Canvas blit + opaque scan.
+     * JPEG frames are already opaque; forceOpaque would cost ~2M pixels/frame.
+     */
     fun pushBitmap(src: Bitmap) {
         val w = src.width.coerceAtLeast(2)
         val h = src.height.coerceAtLeast(2)
         synchronized(lock) {
             bufferW.set(w)
             bufferH.set(h)
-            var bmp = bitmap
-            if (bmp == null || bmp.width != w || bmp.height != h) {
+            if (bitmap !== src) {
                 bitmap?.recycle()
-                bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-                bitmap = bmp
+                bitmap = if (src.isMutable && src.config == Bitmap.Config.ARGB_8888) {
+                    src
+                } else {
+                    src.copy(Bitmap.Config.ARGB_8888, true).also {
+                        if (!src.isRecycled) src.recycle()
+                    }
+                }
             }
-            val c = android.graphics.Canvas(bmp!!)
-            c.drawBitmap(src, 0f, 0f, null)
-            forceOpaque(bmp)
-            bmp.setHasAlpha(false)
+            bitmap!!.setHasAlpha(false)
             generation.incrementAndGet()
         }
-        if (!src.isRecycled) src.recycle()
         val n = frames.incrementAndGet()
         if (n == 1 || n % 120 == 0) {
             log("xr frames=$n ${w}x$h")

@@ -12,6 +12,8 @@ object StereoConfig {
     /** 46° diagonal at 16:9 → 23.53° vertical (Nreal Air). */
     const val DIAGONAL_FOV_DEG = 46f
     const val FOVY_DEG = 23.53f
+    /** Optical panel aspect (each eye). HalfSBS stretches ½-buffer to this. */
+    const val OPTICAL_ASPECT = 16f / 9f
     const val NEAR = 0.08f
     const val FAR = 40f
 

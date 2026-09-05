@@ -33,6 +33,7 @@ class GlassesDisplayController(
     private val focusedId: AtomicReference<String>,
     private val showMarkers: AtomicReference<Boolean>,
     private val stereoEnabled: AtomicBoolean,
+    private val hardware3d: AtomicBoolean,
     private val ipdMeters: AtomicReference<Float>,
     private val pointerBeam: AtomicReference<PointerBeam>,
     private val mirror: MirrorPipeline,
@@ -131,6 +132,7 @@ class GlassesDisplayController(
             focusedId,
             showMarkers,
             stereoEnabled,
+            hardware3d,
             ipdMeters,
             pointerBeam,
             mirror,
@@ -167,9 +169,13 @@ class GlassesDisplayController(
 
     private fun modeLabel(): String {
         return if (stereoEnabled.get()) {
-            "stereo SBS IPD ${"%.0f".format(ipdMeters.get() * 1000f)} mm FOVy ${"%.2f".format(StereoConfig.FOVY_DEG)}°"
+            if (hardware3d.get()) {
+                "hardware 3D SBS (HalfSBS) IPD ${"%.0f".format(ipdMeters.get() * 1000f)} mm"
+            } else {
+                "software SBS IPD ${"%.0f".format(ipdMeters.get() * 1000f)} mm FOVy ${"%.2f".format(StereoConfig.FOVY_DEG)}°"
+            }
         } else {
-            "mono FOVy ${"%.2f".format(StereoConfig.FOVY_DEG)}°"
+            "mono 2D FOVy ${"%.2f".format(StereoConfig.FOVY_DEG)}°"
         }
     }
 

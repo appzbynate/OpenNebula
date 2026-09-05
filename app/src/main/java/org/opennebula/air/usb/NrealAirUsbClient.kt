@@ -93,8 +93,10 @@ class NrealAirUsbClient(
     private var readerJob: Job? = null
     private var readerExecutor: ExecutorService? = null
     private var connection: UsbDeviceConnection? = null
+    private var usbDevice: UsbDevice? = null
     private var claimedInterface: UsbInterface? = null
     private var pendingDetachJob: Job? = null
+    private val mcuLock = Any()
     @Volatile private var readerRunning = false
 
     fun connect() {
@@ -203,8 +205,8 @@ class NrealAirUsbClient(
             }
             emit(
                 LogTags.USB,
-                "iface $i class=${iface.interfaceClass} subclass=${iface.interfaceSubclass} " +
-                    "proto=${iface.interfaceProtocol} $eps",
+                "iface idx=$i id=${iface.id} class=${iface.interfaceClass} " +
+                    "subclass=${iface.interfaceSubclass} proto=${iface.interfaceProtocol} $eps",
             )
         }
     }
@@ -321,6 +323,7 @@ class NrealAirUsbClient(
                     }
                 sendActivation(conn, iface, outEp)
                 connection = conn
+                usbDevice = device
                 claimedInterface = iface
                 startReader(conn, inEp)
             } catch (t: Throwable) {
@@ -332,19 +335,22 @@ class NrealAirUsbClient(
     }
 
     /**
-     * Pre-button claim path (baseline 0.8.92 / working 0.9.x): prefer IMU (3), then MCU (4),
-     * then any interrupt/bulk-IN interface. First successful force-claim wins.
-     * Do not require iface 3 only — that broke units where the IMU IN endpoint isn't on 3.
+     * Pre-button claim path, with one safety change: never claim MCU (4) for the IMU
+     * stream so brightness/3D can use a short-lived claim on the same connection.
+     * Prefer IMU (3), then any other interrupt/bulk-IN interface except MCU.
      */
     private fun claimImuInterface(
         device: UsbDevice,
         conn: UsbDeviceConnection,
     ): Triple<UsbInterface, UsbEndpoint, UsbEndpoint?>? {
+        val mcuId = NrealAirProtocol.MCU_INTERFACE_ID
         val candidates = buildList {
             for (id in NrealAirProtocol.PREFERRED_INTERFACE_IDS) {
+                if (id == mcuId) continue
                 if (id in 0 until device.interfaceCount) add(device.getInterface(id))
             }
             for (i in 0 until device.interfaceCount) {
+                if (i == mcuId) continue
                 val iface = device.getInterface(i)
                 if (none { it.id == iface.id }) add(iface)
             }
@@ -367,19 +373,376 @@ class NrealAirUsbClient(
         return null
     }
 
-    /** MCU I/O still disabled — brightness/3D later. */
+    /**
+     * Hardware display mode via MCU iface 4 (ar-drivers-rs / nrealAirLinuxDriver):
+     * - GET 0x07 → mode at data[1]
+     * - SET 0x08 + [mode]; success when reply data[0] == 0
+     *
+     * Never claimed at connect. One force-claim session for set+verify, then release.
+     * Android HID: prefer SET_REPORT; interrupt OUT is fallback.
+     */
+    fun getDisplayMode(): Int? {
+        return withMcuClaimed { conn, iface, inEp, outEp ->
+            val data = transactMcu(
+                conn, iface, inEp, outEp,
+                NrealAirProtocol.MCU_CMD_GET_DISPLAY_MODE,
+                ByteArray(0),
+            ) ?: return@withMcuClaimed null
+            data.getOrNull(1)?.toInt()?.and(0xFF)
+        }
+    }
+
+    fun setDisplayMode3d(enabled: Boolean, ultrawide: Boolean = false): Boolean {
+        mcuDiagClear()
+        val targets = if (enabled) {
+            if (ultrawide) {
+                // SteamVR: 3840×1080 SBS → 1920×1080 per eye (mode 3), fallback HalfSBS 8.
+                intArrayOf(
+                    NrealAirProtocol.DISPLAY_MODE_3D_SBS_ULTRAWIDE,
+                    NrealAirProtocol.DISPLAY_MODE_3D_SBS,
+                )
+            } else {
+                intArrayOf(NrealAirProtocol.DISPLAY_MODE_3D_SBS)
+            }
+        } else {
+            intArrayOf(NrealAirProtocol.DISPLAY_MODE_2D)
+        }
+        mcuDiag("setDisplayMode3d enabled=$enabled targets=${targets.joinToString()}")
+        data class McuModeResult(val mode: Int?, val wroteUnverified: Boolean)
+        val result = withMcuClaimed { conn, iface, inEp, outEp ->
+            var applied: Int? = null
+            var wroteUnverified = false
+            for (want in targets) {
+                mcuDiag("try SET mode=$want")
+                emit(LogTags.USB, "MCU SET display mode=$want")
+                val ack = transactMcu(
+                    conn, iface, inEp, outEp,
+                    NrealAirProtocol.MCU_CMD_SET_DISPLAY_MODE,
+                    byteArrayOf(want.toByte()),
+                )
+                if (ack == null) {
+                    mcuDiag("SET mode=$want write failed")
+                    continue
+                }
+                val setOk = ack.isNotEmpty() && (ack[0].toInt() and 0xFF) == 0
+                mcuDiag("SET mode=$want ack=${ack.toHex(8)} setOk=$setOk")
+                emit(LogTags.USB, "MCU SET mode=$want ack=${ack.toHex(8)} setOk=$setOk")
+                Thread.sleep(150)
+                val got = transactMcu(
+                    conn, iface, inEp, outEp,
+                    NrealAirProtocol.MCU_CMD_GET_DISPLAY_MODE,
+                    ByteArray(0),
+                )?.getOrNull(1)?.toInt()?.and(0xFF)
+                mcuDiag("GET after SET → $got (want $want)")
+                emit(LogTags.USB, "MCU GET display mode → $got (want $want)")
+                if (got == want || (setOk && enabled && got != null && got != NrealAirProtocol.DISPLAY_MODE_2D)) {
+                    applied = got ?: want
+                    wroteUnverified = false
+                    break
+                }
+                if (setOk) {
+                    // USB write accepted; GET may be unavailable without interrupt-IN.
+                    applied = want
+                    wroteUnverified = got == null
+                    break
+                }
+            }
+            McuModeResult(applied, wroteUnverified)
+        }
+        val mode = result?.mode
+        val ok = when {
+            enabled -> mode != null && mode != NrealAirProtocol.DISPLAY_MODE_2D
+            else -> mode == NrealAirProtocol.DISPLAY_MODE_2D
+        }
+        if (result?.wroteUnverified == true) {
+            mcuDiag("SET wrote but GET unverified — check glasses for blanking/3D")
+        }
+        mcuDiag("result mode=$mode ok=$ok")
+        emit(
+            LogTags.USB,
+            if (ok) "hardware display mode OK mode=$mode"
+            else "hardware display mode FAILED (see ${File(diagDir, "mcu_last.txt").absolutePath})",
+        )
+        return ok
+    }
+
     fun getBrightness(): Int? = null
 
     fun setBrightness(level: Int): Boolean {
-        emit(LogTags.USB, "MCU brightness deferred level=$level")
+        emit(LogTags.USB, "MCU brightness still deferred level=$level")
         return false
     }
 
-    fun getDisplayMode(): Int? = null
+    private fun mcuDiagClear() {
+        runCatching {
+            diagDir.mkdirs()
+            File(diagDir, "mcu_last.txt").writeText("mcu diag ${BuildConfig.VERSION_NAME}\n")
+        }
+    }
 
-    fun setDisplayMode3d(enabled: Boolean): Boolean {
-        emit(LogTags.USB, "MCU display mode deferred 3d=$enabled")
-        return false
+    private fun mcuDiag(line: String) {
+        runCatching {
+            diagDir.mkdirs()
+            File(diagDir, "mcu_last.txt").appendText("${SystemClock.elapsedRealtime()} $line\n")
+        }
+        Log.i(LogTags.ROOT, "MCU $line")
+    }
+
+    private fun <T> withMcuClaimed(
+        block: (UsbDeviceConnection, UsbInterface, UsbEndpoint?, UsbEndpoint?) -> T,
+    ): T? {
+        val conn = connection ?: run {
+            mcuDiag("skipped — not connected")
+            emit(LogTags.USB, "MCU skipped — not connected")
+            return null
+        }
+        val device = usbDevice ?: return null
+        dumpUsbToMcuDiag(device)
+        if (claimedInterface?.id == NrealAirProtocol.MCU_INTERFACE_ID) {
+            mcuDiag("skipped — IMU holds MCU iface")
+            return null
+        }
+        val iface = resolveMcuInterface(device) ?: run {
+            mcuDiag("no MCU HID candidate")
+            return null
+        }
+        val inEp = findEndpoint(iface, UsbConstants.USB_DIR_IN)
+            ?: findAnyEndpoint(iface, UsbConstants.USB_DIR_IN)
+        val outEp = findEndpoint(iface, UsbConstants.USB_DIR_OUT)
+            ?: findAnyEndpoint(iface, UsbConstants.USB_DIR_OUT)
+        mcuDiag(
+            "using iface id=${iface.id} class=${iface.interfaceClass} eps=${iface.endpointCount} " +
+                "in=${inEp?.let { "0x%02X".format(it.address) } ?: "none"} " +
+                "out=${outEp?.let { "0x%02X".format(it.address) } ?: "none"}",
+        )
+        return synchronized(mcuLock) {
+            val claimed = conn.claimInterface(iface, true)
+            mcuDiag("claim force ok=$claimed")
+            emit(
+                LogTags.USB,
+                "MCU claim iface id=${iface.id} force ok=$claimed in=${
+                    inEp?.let { "0x%02X".format(it.address) } ?: "none"
+                }",
+            )
+            if (!claimed) {
+                emit(LogTags.USB, "MCU iface busy — cannot set display mode")
+                return@synchronized null
+            }
+            try {
+                if (inEp != null) drainMcuIn(conn, inEp)
+                block(conn, iface, inEp, outEp)
+            } finally {
+                runCatching { conn.releaseInterface(iface) }
+                mcuDiag("released")
+                emit(LogTags.USB, "MCU iface released")
+            }
+        }
+    }
+
+    private fun dumpUsbToMcuDiag(device: UsbDevice) {
+        mcuDiag("usb ifaces=${device.interfaceCount} imuClaimed=${claimedInterface?.id}")
+        for (i in 0 until device.interfaceCount) {
+            val iface = device.getInterface(i)
+            val eps = (0 until iface.endpointCount).joinToString { e ->
+                val ep = iface.getEndpoint(e)
+                "0x%02X/%s/%s".format(
+                    ep.address,
+                    xferName(ep.type),
+                    if (ep.direction == UsbConstants.USB_DIR_IN) "IN" else "OUT",
+                )
+            }
+            mcuDiag(
+                "  idx=$i id=${iface.id} class=${iface.interfaceClass}/" +
+                    "${iface.interfaceSubclass}/${iface.interfaceProtocol} eps=[$eps]",
+            )
+        }
+    }
+
+    /** Match bInterfaceNumber, not Android list index (they can differ). */
+    private fun findInterfaceByNumber(device: UsbDevice, number: Int): UsbInterface? {
+        for (i in 0 until device.interfaceCount) {
+            val iface = device.getInterface(i)
+            if (iface.id == number) return iface
+        }
+        return null
+    }
+
+    private fun resolveMcuInterface(device: UsbDevice): UsbInterface? {
+        val imuId = claimedInterface?.id
+        val preferred = findInterfaceByNumber(device, NrealAirProtocol.MCU_INTERFACE_ID)
+        if (preferred != null && preferred.id != imuId) {
+            val hasHidShape = preferred.interfaceClass == UsbConstants.USB_CLASS_HID ||
+                findEndpoint(preferred, UsbConstants.USB_DIR_IN) != null ||
+                preferred.endpointCount == 0 // control-only HID still usable via SET_REPORT
+            if (hasHidShape || preferred.interfaceClass == UsbConstants.USB_CLASS_HID) {
+                mcuDiag("candidate preferred id=${preferred.id} class=${preferred.interfaceClass}")
+                return preferred
+            }
+            mcuDiag(
+                "preferred id=${preferred.id} class=${preferred.interfaceClass} " +
+                    "eps=${preferred.endpointCount} — still trying (SET_REPORT)",
+            )
+            return preferred
+        }
+        // Fall back: any other HID iface (class 3) that isn't the IMU stream.
+        for (i in 0 until device.interfaceCount) {
+            val iface = device.getInterface(i)
+            if (iface.id == imuId) continue
+            if (iface.interfaceClass != UsbConstants.USB_CLASS_HID) continue
+            mcuDiag("candidate HID fallback id=${iface.id}")
+            return iface
+        }
+        // Last resort: any non-IMU iface with interrupt IN+OUT (hid-like).
+        for (i in 0 until device.interfaceCount) {
+            val iface = device.getInterface(i)
+            if (iface.id == imuId) continue
+            val inEp = findEndpoint(iface, UsbConstants.USB_DIR_IN)
+            val outEp = findEndpoint(iface, UsbConstants.USB_DIR_OUT)
+            if (inEp != null && outEp != null) {
+                mcuDiag("candidate INT pair id=${iface.id}")
+                return iface
+            }
+        }
+        return null
+    }
+
+    private fun drainMcuIn(conn: UsbDeviceConnection, inEp: UsbEndpoint) {
+        val buf = ByteArray(maxOf(inEp.maxPacketSize, NrealAirProtocol.PACKET_SIZE))
+        repeat(8) {
+            val n = runCatching { conn.bulkTransfer(inEp, buf, buf.size, 20) }.getOrDefault(-1)
+            if (n <= 0) return
+        }
+    }
+
+    private fun writeMcuFrame(
+        conn: UsbDeviceConnection,
+        iface: UsbInterface,
+        outEp: UsbEndpoint?,
+        frame: ByteArray,
+    ): Pair<String, Int> {
+        // On this phone INT_OUT on iface 4 succeeds; SET_REPORT often returns 0.
+        if (outEp != null) {
+            val packetSize = outEp.maxPacketSize.takeIf { it > 0 } ?: NrealAirProtocol.PACKET_SIZE
+            val payload = ByteArray(packetSize)
+            frame.copyInto(payload, endIndex = minOf(frame.size, packetSize))
+            val n = conn.bulkTransfer(outEp, payload, payload.size, NrealAirProtocol.ACTIVATION_TIMEOUT_MS)
+            if (n > 0) return "INT_OUT" to n
+        }
+        val ctrl = conn.controlTransfer(
+            USB_HID_SET_REPORT_TYPE,
+            HID_SET_REPORT,
+            HID_REPORT_OUTPUT,
+            iface.id,
+            frame,
+            frame.size,
+            NrealAirProtocol.ACTIVATION_TIMEOUT_MS,
+        )
+        if (ctrl > 0) return "SET_REPORT" to ctrl
+        val withId = byteArrayOf(0) + frame
+        val ctrl2 = conn.controlTransfer(
+            USB_HID_SET_REPORT_TYPE,
+            HID_SET_REPORT,
+            HID_REPORT_OUTPUT,
+            iface.id,
+            withId,
+            withId.size,
+            NrealAirProtocol.ACTIVATION_TIMEOUT_MS,
+        )
+        if (ctrl2 > 0) return "SET_REPORT+id0" to ctrl2
+        val feat = conn.controlTransfer(
+            USB_HID_SET_REPORT_TYPE,
+            HID_SET_REPORT,
+            HID_REPORT_FEATURE,
+            iface.id,
+            frame,
+            frame.size,
+            NrealAirProtocol.ACTIVATION_TIMEOUT_MS,
+        )
+        return "SET_REPORT+feat" to feat
+    }
+
+    private fun transactMcu(
+        conn: UsbDeviceConnection,
+        iface: UsbInterface,
+        inEp: UsbEndpoint?,
+        outEp: UsbEndpoint?,
+        cmd: Int,
+        data: ByteArray,
+    ): ByteArray? {
+        val frame = NrealAirProtocol.mcuControlFrame(cmd, data)
+        val (via, written) = writeMcuFrame(conn, iface, outEp, frame)
+        mcuDiag("cmd=0x%04X write via=$via n=$written".format(cmd))
+        emit(LogTags.USB, "MCU cmd 0x%04X write via=$via returned $written".format(cmd))
+        if (written <= 0) return null
+
+        val deadline = SystemClock.elapsedRealtime() + NrealAirProtocol.MCU_COMMAND_TIMEOUT_MS
+        val packetSize = inEp?.maxPacketSize?.takeIf { it > 0 } ?: NrealAirProtocol.PACKET_SIZE
+        val buf = ByteArray(packetSize + 1)
+        var skipped = 0
+        while (SystemClock.elapsedRealtime() < deadline) {
+            val n = when {
+                inEp != null -> try {
+                    conn.bulkTransfer(inEp, buf, buf.size, 100)
+                } catch (t: Throwable) {
+                    mcuDiag("cmd=0x%04X read threw ${t.javaClass.simpleName}".format(cmd))
+                    return null
+                }
+                else -> {
+                    // No interrupt IN — try HID GET_REPORT (Input) on the control pipe.
+                    val got = conn.controlTransfer(
+                        USB_HID_GET_REPORT_TYPE,
+                        HID_GET_REPORT,
+                        HID_REPORT_INPUT,
+                        iface.id,
+                        buf,
+                        buf.size,
+                        100,
+                    )
+                    if (got <= 0) {
+                        Thread.sleep(20)
+                        0
+                    } else {
+                        got
+                    }
+                }
+            }
+            if (n <= 0) continue
+            val packet = when {
+                n >= 1 && (buf[0].toInt() and 0xFF) == 0xFD -> buf.copyOf(n)
+                n >= 2 && (buf[1].toInt() and 0xFF) == 0xFD -> buf.copyOfRange(1, n)
+                else -> {
+                    skipped++
+                    continue
+                }
+            }
+            val reply = NrealAirProtocol.parseMcuReply(packet)
+            if (reply == null) {
+                skipped++
+                continue
+            }
+            if (reply.first == cmd) {
+                mcuDiag("cmd=0x%04X reply data=${reply.second.toHex(8)}".format(cmd))
+                return reply.second
+            }
+            skipped++
+        }
+        // Write reached the device; without a matching reply, still surface a soft ack for SET
+        // so callers can tell "sent" vs "USB failed".
+        if (cmd == NrealAirProtocol.MCU_CMD_SET_DISPLAY_MODE && data.isNotEmpty()) {
+            mcuDiag("cmd=0x%04X no reply — soft-ack after write (skipped=$skipped)".format(cmd))
+            return byteArrayOf(0)
+        }
+        mcuDiag("cmd=0x%04X timed out skipped=$skipped".format(cmd))
+        emit(LogTags.USB, "MCU cmd 0x%04X timed out (skipped $skipped)".format(cmd))
+        return null
+    }
+
+    private fun findAnyEndpoint(iface: UsbInterface, direction: Int): UsbEndpoint? {
+        for (i in 0 until iface.endpointCount) {
+            val ep = iface.getEndpoint(i)
+            if (ep.direction == direction) return ep
+        }
+        return null
     }
 
     private fun findEndpoint(iface: UsbInterface, direction: Int): UsbEndpoint? {
@@ -651,6 +1014,7 @@ class NrealAirUsbClient(
         val conn = connection
         claimedInterface = null
         connection = null
+        usbDevice = null
         if (conn != null && iface != null) {
             runCatching { conn.releaseInterface(iface) }
         }
@@ -673,6 +1037,8 @@ class NrealAirUsbClient(
             tag.endsWith("/Perm") -> Log.i(tag, message)
             else -> Log.i(tag, message)
         }
+        // Also plain tag — some ROMs drop tags with '/'.
+        Log.i(LogTags.ROOT, "$tag $message")
         onLog(tag, message)
     }
 
@@ -718,9 +1084,13 @@ class NrealAirUsbClient(
         private const val DETACH_DEBOUNCE_MS = 600L
         private const val HUD_PERIOD_MS = 50L // 20 Hz phone HUD
         private const val UI_PERIOD_MS = 200L // 5 Hz log lines
-        private const val USB_HID_SET_REPORT_TYPE = 0x21
+        private const val USB_HID_SET_REPORT_TYPE = 0x21 // host→device class
+        private const val USB_HID_GET_REPORT_TYPE = 0xA1 // device→host class
         private const val HID_SET_REPORT = 0x09
+        private const val HID_GET_REPORT = 0x01
+        private const val HID_REPORT_INPUT = 0x0100
         private const val HID_REPORT_OUTPUT = 0x0200
+        private const val HID_REPORT_FEATURE = 0x0300
     }
 }
 

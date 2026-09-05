@@ -42,11 +42,11 @@ fun SteamVrDialog(
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text(
-                    "SteamVR Home needs Desktop Mirror on the PC (Status window is not the home).\n" +
-                        "1) Start SteamVR Home.\n" +
-                        "2) SteamVR Settings → Desktop → enable Mirror.\n" +
-                        "3) Run start_bridge.bat — it should say capturing 'Mirror…'.\n" +
-                        "4) Use a 192.168.x IP → Go (fullscreen on glasses).",
+                    "Nebula-style SteamVR: PC streams packed SBS; glasses auto-enter hardware 3D.\n" +
+                        "1) Run tools\\xr-bridge\\start_bridge.bat on the PC.\n" +
+                        "2) Enter PC IP → Go (app forces 3D for you).\n" +
+                        "3) Bridge should log capturing OpenTrack/Mirror SBS — not a red eye.\n" +
+                        "4) If you see a red eye, SteamVR is still in monitor mode; wait for Home or relaunch.",
                     style = MaterialTheme.typography.bodySmall,
                 )
                 Text(state.status, style = MaterialTheme.typography.bodyMedium)

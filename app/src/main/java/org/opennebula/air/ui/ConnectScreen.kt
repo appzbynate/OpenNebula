@@ -304,8 +304,8 @@ fun ConnectScreenContent(
             ) {
                 Switch(checked = stereo, onCheckedChange = onStereo)
                 Text(
-                    if (stereo) "Stereo SBS — OpenNebula sets hardware 3D automatically."
-                    else "Mono — single camera",
+                    if (stereo) "Hardware 3D SBS — toggle off for 2D."
+                    else "2D mirror — toggle on for hardware 3D.",
                     style = MaterialTheme.typography.bodyMedium,
                     modifier = Modifier.weight(1f),
                 )

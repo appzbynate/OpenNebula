@@ -8,13 +8,16 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import org.opennebula.air.mirror.MirrorPipeline
+import java.io.BufferedInputStream
 import java.io.DataInputStream
 import java.net.InetSocketAddress
 import java.net.Socket
 
 /**
  * TCP MJPEG client: length-prefixed JPEG frames from the PC companion.
- * Frame header: u32 LE magic 'JFIF' / 'ONXR', u32 LE byte length, then JPEG bytes.
+ * Frame header: u32 LE magic 'ONXR', u32 LE byte length, then JPEG bytes.
+ *
+ * Drops backlog frames so Wi‑Fi jitter does not turn head motion into slow-mo.
  */
 class XrVideoClient(
     private val scope: CoroutineScope,
@@ -32,12 +35,20 @@ class XrVideoClient(
             try {
                 Socket().use { sock ->
                     sock.tcpNoDelay = true
+                    // Tiny recv buffer — prefer drop over queuing stale frames.
+                    runCatching { sock.receiveBufferSize = 128 * 1024 }
                     sock.connect(InetSocketAddress(address, port), 4_000)
                     onStatus("video linked")
                     onLog("video ← $address:$port")
                     pipeline.setActive(true)
-                    val input = DataInputStream(sock.getInputStream())
+                    val input = DataInputStream(BufferedInputStream(sock.getInputStream(), 32 * 1024))
                     val header = ByteArray(8)
+                    val opts = BitmapFactory.Options().apply {
+                        inPreferredConfig = Bitmap.Config.ARGB_8888
+                        inMutable = true
+                    }
+                    var decoded = 0
+                    var dropped = 0
                     while (isActive) {
                         input.readFully(header)
                         val magic = ((header[0].toInt() and 0xff)) or
@@ -58,8 +69,18 @@ class XrVideoClient(
                         }
                         val jpeg = ByteArray(len)
                         input.readFully(jpeg)
-                        val bmp = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size) ?: continue
+                        // Drop this frame if another full header is already waiting.
+                        if (input.available() >= 8) {
+                            dropped++
+                            continue
+                        }
+                        val bmp = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size, opts) ?: continue
                         pipeline.pushBitmap(bmp)
+                        decoded++
+                        if (decoded == 1 || (decoded % 240 == 0 && dropped > 0)) {
+                            onLog("video frames=$decoded dropped=$dropped")
+                            dropped = 0
+                        }
                     }
                 }
                 if (isActive) onFailed("Video stream ended — is the PC companion still running?")

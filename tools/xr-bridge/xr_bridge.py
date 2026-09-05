@@ -16,8 +16,9 @@ import threading
 import time
 from dataclasses import dataclass
 
-from freetrack_shm import FreeTrackWriter
+from freetrack_shm import FreeTrackWriter, POSE_MAPS
 from steamvr_hmd import activate_headset_session
+from pathlib import Path
 
 MAGIC_U32 = 0x52584E4F  # 'ONXR' LE
 DISCOVERY_PORT = 38400
@@ -161,61 +162,70 @@ def beacon_loop(stop: threading.Event) -> None:
     sock.close()
 
 
-def pose_loop(stop: threading.Event, opentrack: bool) -> None:
+def pose_loop(stop: threading.Event, opentrack: bool, pose_map: str = "legacy") -> None:
     global latest, pose_packets
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(("0.0.0.0", POSE_PORT))
     sock.settimeout(0.5)
     out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) if opentrack else None
-    ft = FreeTrackWriter()
+    log_path = Path(__file__).resolve().parent / "pose_axis.csv"
+    ft = FreeTrackWriter(pose_map=pose_map, log_path=log_path)
     print(
         f"[pose] UDP listening 0.0.0.0:{POSE_PORT}"
         + (" → OpenTrack :4242" if opentrack else "")
-        + (f" → FreeTrack SHM OK" if ft.ok else f" (FreeTrack SHM fail: {ft.error})")
+        + (f" → FreeTrack SHM OK map={ft.pose_map}" if ft.ok else f" (FreeTrack SHM fail: {ft.error})")
     )
-    while not stop.is_set():
-        try:
-            data, addr = sock.recvfrom(64)
-        except socket.timeout:
-            continue
-        except OSError:
-            break
-        if len(data) < 48:
-            continue
-        magic, seq, t_ns, qw, qx, qy, qz, yaw_deg, pitch_deg, roll_deg, height = struct.unpack(
-            "<IIqffffffff", data[:48]
-        )
-        if magic != MAGIC_U32:
-            continue
-        pose_packets += 1
-        if pose_packets == 1 or pose_packets % 500 == 0:
-            print(
-                f"[pose] packets={pose_packets} from {addr[0]} "
-                f"ypr={yaw_deg:.1f},{pitch_deg:.1f},{roll_deg:.1f}"
+    print(f"[pose] axis diag → {log_path}")
+    print("[pose] test: nod (pitch), turn (yaw), tilt (roll) — watch [pose-axis] lines")
+    try:
+        while not stop.is_set():
+            try:
+                data, addr = sock.recvfrom(64)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if len(data) < 48:
+                continue
+            magic, seq, t_ns, qw, qx, qy, qz, yaw_deg, pitch_deg, roll_deg, height = struct.unpack(
+                "<IIqffffffff", data[:48]
             )
-        pose = Pose(qw, qx, qy, qz, height)
-        with latest_lock:
-            latest = pose
-        # Prefer phone Madgwick euler (x/y/z slots). Fallback if old app sent height in y.
-        if abs(yaw_deg) < 0.01 and abs(pitch_deg) < 0.01 and abs(roll_deg) < 0.01 and abs(height) > 0.5:
-            ft.write_euler(0.0, 0.0, 0.0, height)
-        else:
-            ft.write_euler(yaw_deg, pitch_deg, roll_deg, height)
-        if out is not None:
-            # OpenTrack UDP expects degrees; same axes as FreeTrack (no pitch/roll swap).
-            pkt = struct.pack(
-                "<dddddd",
-                float(yaw_deg),
-                float(pitch_deg),
-                float(roll_deg),
-                0.0,
-                float(height) * 100.0,
-                0.0,
-            )
-            out.sendto(pkt, ("127.0.0.1", OPENTRACK_PORT))
-    sock.close()
-    if out:
-        out.close()
+            if magic != MAGIC_U32:
+                continue
+            pose_packets += 1
+            if pose_packets == 1 or pose_packets % 500 == 0:
+                print(
+                    f"[pose] packets={pose_packets} from {addr[0]} "
+                    f"ypr={yaw_deg:.1f},{pitch_deg:.1f},{roll_deg:.1f}"
+                )
+            pose = Pose(qw, qx, qy, qz, height)
+            with latest_lock:
+                latest = pose
+            # Prefer phone Madgwick euler (x/y/z slots). Fallback if old app sent height in y.
+            if abs(yaw_deg) < 0.01 and abs(pitch_deg) < 0.01 and abs(roll_deg) < 0.01 and abs(height) > 0.5:
+                ft.write_euler(0.0, 0.0, 0.0, height)
+            else:
+                ft.write_euler(yaw_deg, pitch_deg, roll_deg, height)
+            if out is not None:
+                # Same channel map as FreeTrack (degrees) for OpenTrack UDP consumers.
+                from freetrack_shm import POSE_MAPS, apply_channel_map
+
+                my, mp, mr = apply_channel_map(POSE_MAPS[ft.pose_map], yaw_deg, pitch_deg, roll_deg)
+                pkt = struct.pack(
+                    "<dddddd",
+                    float(my),
+                    float(mp),
+                    float(mr),
+                    0.0,
+                    float(height) * 100.0,
+                    0.0,
+                )
+                out.sendto(pkt, ("127.0.0.1", OPENTRACK_PORT))
+    finally:
+        sock.close()
+        if out:
+            out.close()
+        ft.close_log()
 
 
 def control_loop(stop: threading.Event) -> None:
@@ -278,7 +288,10 @@ def video_loop(stop: threading.Event, fps: float, quality: int) -> None:
     print(f"[video] {mirror_msg}")
     print(f"[video] {cap_note}  live_steamvr_frame={'yes' if has_cap else 'no — showing lobby until Mirror is visible'}")
     lobby = make_vr_lobby_jpeg()
-    period = 1.0 / max(fps, 1.0)
+    # fps<=0 → uncapped (send as fast as capture/encode allows).
+    period = 0.0 if fps <= 0 else 1.0 / max(fps, 1.0)
+    print(f"[video] target={'uncapped' if period <= 0 else f'{fps:.0f} fps'} quality={quality}")
+    print("[video] latest-frame pipeline (capture never waits on Wi‑Fi send)")
     while not stop.is_set():
         try:
             conn, addr = server.accept()
@@ -286,18 +299,50 @@ def video_loop(stop: threading.Event, fps: float, quality: int) -> None:
             continue
         video_clients += 1
         print(f"[video] phone connected from {addr[0]} — immersive stream")
-        # Do NOT launch SteamVR here — phone already sent LAUNCH on :38403.
-        # Double-start caused SteamVR Fail (422) / Shared IPC Compositor 306.
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         try:
-            while not stop.is_set():
-                t0 = time.time()
-                jpeg = grab_steamvr_or_desktop_jpeg(quality) or lobby
-                header = struct.pack("<II", MAGIC_U32, len(jpeg))
-                conn.sendall(header + jpeg)
-                dt = time.time() - t0
-                if dt < period:
-                    time.sleep(period - dt)
+            try:
+                # Tiny send buffer — prefer drop/block over queuing old frames.
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 64 * 1024)
+            except OSError:
+                pass
+
+            # Capture thread always overwrites "latest"; sender only ships newest.
+            latest_jpeg: list[bytes | None] = [lobby]
+            latest_lock_v = threading.Lock()
+            gen = [0]
+            conn_stop = threading.Event()
+
+            def capture_worker() -> None:
+                while not stop.is_set() and not conn_stop.is_set():
+                    t0 = time.time()
+                    jpeg = grab_steamvr_or_desktop_jpeg(quality) or lobby
+                    with latest_lock_v:
+                        latest_jpeg[0] = jpeg
+                        gen[0] += 1
+                    if period > 0:
+                        remain = period - (time.time() - t0)
+                        if remain > 0.001:
+                            time.sleep(remain)
+                    else:
+                        time.sleep(0.0)
+
+            cap_t = threading.Thread(target=capture_worker, name="xr-capture", daemon=True)
+            cap_t.start()
+            sent_gen = -1
+            try:
+                while not stop.is_set():
+                    with latest_lock_v:
+                        g = gen[0]
+                        jpeg = latest_jpeg[0]
+                    if jpeg is None or g == sent_gen:
+                        time.sleep(0.001)
+                        continue
+                    sent_gen = g
+                    header = struct.pack("<II", MAGIC_U32, len(jpeg))
+                    conn.sendall(header + jpeg)
+            finally:
+                conn_stop.set()
         except OSError as err:
             print(f"[video] phone disconnected: {err}")
         finally:
@@ -309,14 +354,25 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="OpenNebula XR Bridge PC companion")
     ap.add_argument("--no-opentrack", action="store_true")
     ap.add_argument("--no-video", action="store_true")
-    ap.add_argument("--fps", type=float, default=24.0)
-    ap.add_argument("--quality", type=int, default=65)
+    # 0 = uncapped (lowest latency). Capture/encode is the limiter.
+    ap.add_argument("--fps", type=float, default=0.0)
+    ap.add_argument("--quality", type=int, default=35)
+    ap.add_argument(
+        "--pose-map",
+        default="legacy",
+        choices=sorted(POSE_MAPS.keys()),
+        help="Phone→FreeTrack axis map (default legacy = yaw/pitch/roll straight)",
+    )
     args = ap.parse_args()
 
     stop = threading.Event()
     threads = [
         threading.Thread(target=beacon_loop, args=(stop,), daemon=True),
-        threading.Thread(target=pose_loop, args=(stop, not args.no_opentrack), daemon=True),
+        threading.Thread(
+            target=pose_loop,
+            args=(stop, not args.no_opentrack, args.pose_map),
+            daemon=True,
+        ),
         threading.Thread(target=control_loop, args=(stop,), daemon=True),
     ]
     if not args.no_video:
@@ -328,6 +384,7 @@ def main() -> None:
     print("=" * 60)
     print("  OpenNebula XR Bridge RUNNING — leave this window open")
     print("  Phone → SteamVR → 192.168.x IP below → Go")
+    print(f"  Pose map: {args.pose_map}  ({POSE_MAPS[args.pose_map]})  log: pose_axis.csv")
     print("  On Go: installs OpenTrack HMD driver, launches SteamVR, streams Home/Mirror")
     for ip in (lan or local_ips() or ["(run ipconfig)"]):
         print(f"      {ip}")

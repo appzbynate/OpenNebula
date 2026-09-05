@@ -20,7 +20,7 @@ object NrealAirProtocol {
     const val USB_TRANSFER_TIMEOUT_MS = 250
     const val ACTIVATION_TIMEOUT_MS = 1_000
     const val IMU_COMMAND_TIMEOUT_MS = 1_000
-    const val MCU_COMMAND_TIMEOUT_MS = 1_000
+    const val MCU_COMMAND_TIMEOUT_MS = 2_000
     const val IMU_CONFIG_MAX_BYTES = 256 * 1024
 
     const val IMU_CMD_GET_CONFIG_LEN = 0x14
@@ -34,8 +34,16 @@ object NrealAirProtocol {
 
     const val BRIGHTNESS_MIN = 0
     const val BRIGHTNESS_MAX = 7
+    /** 1920×1080 mirror (both eyes same). */
     const val DISPLAY_MODE_2D = 1
-    const val DISPLAY_MODE_3D_SBS = 3
+    /** 3840×1080 native SBS — PC/EDID switch; often wrong for phone DP. */
+    const val DISPLAY_MODE_3D_SBS_ULTRAWIDE = 3
+    /**
+     * 1920×1080 SBS (ar-drivers HalfSBS / linux `1920x1080_60_SBS`).
+     * Same panel timing as 2D; glasses split left/right halves to each eye.
+     * Correct match for OpenNebula software SBS on phone DisplayPort.
+     */
+    const val DISPLAY_MODE_3D_SBS = 8
 
     /**
      * 64-byte IMU HID control frame that enables the sensor stream.

@@ -37,6 +37,7 @@ class WorldRenderer(
     private val focusedId: AtomicReference<String>,
     private val showMarkers: AtomicReference<Boolean>,
     private val stereoEnabled: AtomicBoolean,
+    private val hardware3d: AtomicBoolean,
     private val ipdMeters: AtomicReference<Float>,
     private val pointerBeam: AtomicReference<PointerBeam>,
     private val mirror: MirrorPipeline,
@@ -213,6 +214,13 @@ class WorldRenderer(
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
         surfaceW = width.coerceAtLeast(1)
         surfaceH = height.coerceAtLeast(1)
+        if (stereoEnabled.get()) {
+            Log.i(
+                LogTags.DISPLAY,
+                "stereo surface ${surfaceW}x$surfaceH half=${surfaceW / 2} " +
+                    "aspect=${"%.3f".format(surfaceW.toFloat() / surfaceH)} hw3d=${hardware3d.get()}",
+            )
+        }
         GLES20.glViewport(0, 0, surfaceW, surfaceH)
     }
 
@@ -255,31 +263,46 @@ class WorldRenderer(
             ),
         )
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
-        // Translucent Presentation: SteamVR needs opaque clear or the layer stays invisible.
+        // SteamVR immersive: PC sends packed Half-SBS (L|R). Blit once across the
+        // full framebuffer and let MCU mode 8 split eyes — do NOT software-split
+        // viewports (that duplicated the whole SBS into each eye).
         if (steamVr.enabled.get() && steamVr.generation.get() > 0) {
+            uploadSteamVr()
             GLES20.glClearColor(0f, 0f, 0f, 1f)
             GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
-        } else {
-            GLES20.glClearColor(0f, 0f, 0f, 0f)
+            GLES20.glViewport(0, 0, surfaceW, surfaceH)
+            GLES20.glDisable(GLES20.GL_BLEND)
+            GLES20.glDisable(GLES20.GL_DEPTH_TEST)
+            drawTex(identityMvp, steamVrTex, immersiveQuad, immersiveQuadCount, opaque = true)
+            GLES20.glEnable(GLES20.GL_DEPTH_TEST)
+            GLES20.glEnable(GLES20.GL_BLEND)
+            return
         }
+        GLES20.glClearColor(0f, 0f, 0f, 0f)
         val stereo = stereoEnabled.get() && surfaceW >= 2
         if (stereo) {
             val half = surfaceW / 2
-            val aspect = half.toFloat() / surfaceH.toFloat()
+            val surfaceAspect = surfaceW.toFloat() / surfaceH.toFloat().coerceAtLeast(1f)
+            // Ultrawide SBS (~3840×1080): each half is already 16:9 — use buffer eye aspect.
+            // HalfSBS (~1920×1080, MCU mode 8): firmware stretches each half to full eye FOV —
+            // project with Air optical 16:9 (same as mono), not half-buffer aspect.
+            val eyeAspect = if (surfaceAspect >= 3.0f) {
+                half.toFloat() / surfaceH.toFloat().coerceAtLeast(1f)
+            } else {
+                StereoConfig.OPTICAL_ASPECT
+            }
+            val proj = PoseMath.perspective(
+                StereoConfig.FOVY_DEG, eyeAspect, StereoConfig.NEAR, StereoConfig.FAR,
+            )
             val ipd = ipdMeters.get()
-            val conv = StereoConfig.convergenceMeters()
             val leftX = StereoConfig.leftEyeX(ipd)
             val rightX = StereoConfig.rightEyeX(ipd)
-            val leftProj = PoseMath.perspectiveOffAxis(
-                StereoConfig.FOVY_DEG, aspect, StereoConfig.NEAR, StereoConfig.FAR, leftX, conv,
-            )
-            val rightProj = PoseMath.perspectiveOffAxis(
-                StereoConfig.FOVY_DEG, aspect, StereoConfig.NEAR, StereoConfig.FAR, rightX, conv,
-            )
-            drawEye(0, 0, half, surfaceH, leftProj, PoseMath.viewForEye(centerView, leftX))
-            drawEye(half, 0, surfaceW - half, surfaceH, rightProj, PoseMath.viewForEye(centerView, rightX))
+            drawEye(0, 0, half, surfaceH, proj, PoseMath.viewForEye(centerView, leftX))
+            drawEye(half, 0, surfaceW - half, surfaceH, proj, PoseMath.viewForEye(centerView, rightX))
         } else {
-            val aspect = surfaceW.toFloat() / surfaceH.toFloat()
+            // Mono: prefer measured surface; fall back to Air 16:9 if the surface is nonsense.
+            val aspect = (surfaceW.toFloat() / surfaceH.toFloat().coerceAtLeast(1f))
+                .let { if (it in 1.2f..2.2f) it else StereoConfig.OPTICAL_ASPECT }
             val proj = PoseMath.perspective(
                 StereoConfig.FOVY_DEG, aspect, StereoConfig.NEAR, StereoConfig.FAR,
             )
@@ -296,14 +319,8 @@ class WorldRenderer(
         centerView: FloatArray,
     ) {
         GLES20.glViewport(x, y, w, h)
-        // Immersive SteamVR only while actively streaming (enabled + frames).
+        // Immersive SteamVR is drawn once in drawWorld() as packed SBS.
         if (steamVr.enabled.get() && steamVr.generation.get() > 0) {
-            uploadSteamVr()
-            GLES20.glDisable(GLES20.GL_BLEND)
-            GLES20.glDisable(GLES20.GL_DEPTH_TEST)
-            drawTex(identityMvp, steamVrTex, immersiveQuad, immersiveQuadCount, opaque = true)
-            GLES20.glEnable(GLES20.GL_DEPTH_TEST)
-            GLES20.glEnable(GLES20.GL_BLEND)
             return
         }
         val mvp = PoseMath.multiply(proj, centerView)

@@ -152,14 +152,14 @@ def ensure_opentrack_driver() -> str:
         except Exception as err:
             return f"driver install failed: {err}"
 
-    # Window must land on a real DXGI output (Fail 422 = InvalidOutputDesktop).
+    # Nebula / Domtaro: ultrawide SBS window (3840×1080) for Air mode 3.
     mon_w, mon_h = primary_monitor_size()
-    win_w = min(1920, max(1280, mon_w // 2))
-    win_h = min(1080, max(720, mon_h - 80))
+    win_w = 3840
+    win_h = 1080
     if win_w > mon_w - 40:
-        win_w = max(800, mon_w - 80)
+        win_w = max(1920, mon_w - 80)
     if win_h > mon_h - 40:
-        win_h = max(600, mon_h - 80)
+        win_h = max(720, mon_h - 80)
 
     settings = dest / "resources" / "settings" / "default.vrsettings"
     try:
@@ -175,18 +175,24 @@ def ensure_opentrack_driver() -> str:
                 block["windowHeight"] = win_h
                 block["renderWidth"] = win_w
                 block["renderHeight"] = win_h
-                block["DistanceBetweenEyes"] = 0
+                block["DistanceBetweenEyes"] = 1
+                # Match OpenNebula StereoConfig / typical adult (~63 mm). 65 mm felt
+                # hyperstereo / disorienting with Air's fixed optics.
+                block["ipd"] = 0.063
                 block["windowX"] = 0
                 block["windowY"] = 0
                 block["ScreenOffsetX"] = 0
-                block["FOV"] = 57.296
-                block["displayFrequency"] = 60
+                # OpenTrack quirk: FOV° → radians, used as GetProjectionRaw tan(half-angle).
+                # effective_fov = 2*atan(radians(FOV)). Air is 46° diagonal @ 16:9
+                # → ~40.61° horizontal → FOV≈21.2. Slightly wider (24 → ~45.4°) = mild zoom-out.
+                block["FOV"] = 24.0
+                block["displayFrequency"] = 72
                 block["ZoomWidth"] = 1.0
                 block["ZoomHeight"] = 1.0
             settings.write_text(json.dumps(data, indent=2), encoding="utf-8")
     except Exception:
         pass
-    return f"HMD driver ready at {dest} window={win_w}x{win_h}@0,0 (monitor {mon_w}x{mon_h})"
+    return f"HMD driver ready at {dest} SBS window={win_w}x{win_h} eyes=1 (monitor {mon_w}x{mon_h})"
 
 
 def enable_force_hmd() -> str:
@@ -203,9 +209,10 @@ def enable_force_hmd() -> str:
         steamvr["requireHmd"] = True
         steamvr["activateMultipleDrivers"] = False
         # Home often triggers compositor races with desktop HMDs.
-        steamvr["enableHomeApp"] = False
+        steamvr["enableHomeApp"] = True
         steamvr["showMirrorView"] = True
-        steamvr["mirrorViewEye"] = 0
+        # Both eyes when supported — left-only (0) fed the red-placeholder mono path.
+        steamvr["mirrorViewEye"] = 2
         steamvr["forcedDriver"] = "opentrack"
         # Clear broken mirror geometry if present.
         for bad in ("mirrorWindowX", "mirrorWindowY", "mirrorWindowWidth", "mirrorWindowHeight"):
@@ -265,4 +272,12 @@ def activate_headset_session(repair: bool = True) -> str:
         lines.append(ensure_opentrack_driver())
         lines.append(enable_force_hmd())
         lines.append(launch_steamvr())
+        # Give compositor a moment, then focus OpenTrack window (kills red placeholder).
+        time.sleep(2.0)
+        try:
+            from steamvr_capture import focus_headset_window
+
+            lines.append(focus_headset_window(force=True))
+        except Exception as err:
+            lines.append(f"focus: {err}")
         return " | ".join(lines)

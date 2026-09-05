@@ -6,7 +6,8 @@ import org.opennebula.air.render.StereoConfig
 class DisplayPrefs(context: Context) {
     private val prefs = context.applicationContext.getSharedPreferences(NAME, Context.MODE_PRIVATE)
 
-    fun stereo(): Boolean = prefs.getBoolean(STEREO, true)
+    /** Always false until the user toggles 3D; old `stereo=true` prefs are ignored. */
+    fun stereo(): Boolean = false
 
     fun brightness(): Int = prefs.getInt(BRIGHTNESS, 5).coerceIn(0, 7)
 

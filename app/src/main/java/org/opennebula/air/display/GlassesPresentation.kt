@@ -30,6 +30,7 @@ class GlassesPresentation(
     focusedId: AtomicReference<String>,
     showMarkers: AtomicReference<Boolean>,
     stereoEnabled: AtomicBoolean,
+    hardware3d: AtomicBoolean,
     ipdMeters: AtomicReference<Float>,
     pointerBeam: AtomicReference<PointerBeam>,
     mirror: MirrorPipeline,
@@ -42,7 +43,7 @@ class GlassesPresentation(
 ) : Presentation(context, display, android.R.style.Theme_Black_NoTitleBar_Fullscreen) {
 
     private val renderer = WorldRenderer(
-        poseRef, layers, focusedId, showMarkers, stereoEnabled, ipdMeters, pointerBeam, mirror, chrome,
+        poseRef, layers, focusedId, showMarkers, stereoEnabled, hardware3d, ipdMeters, pointerBeam, mirror, chrome,
         iconGrid, gridOpen, gridPose, browser, steamVr,
     )
     private val surface = GLSurfaceView(context).apply {
