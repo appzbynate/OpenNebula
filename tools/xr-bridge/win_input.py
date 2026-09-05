@@ -9,6 +9,7 @@ from desktop_capture import monitor_origin_size
 
 user32 = ctypes.windll.user32
 
+MOUSEEVENTF_MOVE = 0x0001
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
 MOUSEEVENTF_RIGHTDOWN = 0x0008
@@ -98,11 +99,27 @@ def apply_buttons(mask: int) -> None:
     _buttons = mask
 
 
-def pointer(u: float, v: float, buttons: int = 0, wheel: int = 0) -> None:
+def move_rel(dx: int, dy: int) -> None:
+    """Relative mouse move (laptop trackpad style)."""
+    if dx == 0 and dy == 0:
+        return
+    inp = INPUT()
+    inp.type = INPUT_MOUSE
+    inp.union.mi = MOUSEINPUT(int(dx), int(dy), 0, MOUSEEVENTF_MOVE, 0, None)
+    user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+
+
+def wheel(delta: int) -> None:
+    if not delta:
+        return
+    _mouse_flags(MOUSEEVENTF_WHEEL, int(delta) * WHEEL_DELTA)
+
+
+def pointer(u: float, v: float, buttons: int = 0, wheel_ticks: int = 0) -> None:
     move_to_uv(u, v)
     apply_buttons(buttons)
-    if wheel:
-        _mouse_flags(MOUSEEVENTF_WHEEL, int(wheel) * WHEEL_DELTA)
+    if wheel_ticks:
+        wheel(wheel_ticks)
 
 
 def click(u: float, v: float, button: int = 0) -> None:

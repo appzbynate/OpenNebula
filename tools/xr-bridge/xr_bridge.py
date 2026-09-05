@@ -234,7 +234,8 @@ def control_loop(stop: threading.Event) -> None:
 
     LAUNCH / HELLO  → SteamVR + HMD driver
     DESKTOP         → warm desktop capture, OK
-    PTR u v buttons [wheel]  → mouse (u,v in 0..1 on primary)
+    PTR u v buttons [wheel]  → absolute mouse (u,v in 0..1 on primary)
+    REL dx dy [buttons]      → relative mouse (trackpad)
     CLICK u v [button]
     KEY down|up vk
     """
@@ -280,6 +281,14 @@ def control_loop(stop: threading.Event) -> None:
                 buttons = int(float(parts[3]))
                 wheel = int(float(parts[4])) if len(parts) >= 5 else 0
                 win_input.pointer(u, v, buttons, wheel)
+            elif cmd == "REL" and len(parts) >= 3:
+                dx = int(float(parts[1]))
+                dy = int(float(parts[2]))
+                win_input.move_rel(dx, dy)
+                if len(parts) >= 4:
+                    win_input.apply_buttons(int(float(parts[3])))
+            elif cmd == "WHEEL" and len(parts) >= 2:
+                win_input.wheel(int(float(parts[1])))
             elif cmd == "CLICK" and len(parts) >= 3:
                 u = float(parts[1])
                 v = float(parts[2])

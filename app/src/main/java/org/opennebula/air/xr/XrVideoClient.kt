@@ -25,6 +25,7 @@ class XrVideoClient(
     private val onLog: (String) -> Unit = {},
     private val onStatus: (String) -> Unit = {},
     private val onFailed: (String) -> Unit = {},
+    private val onFrameSize: (Int, Int) -> Unit = { _, _ -> },
 ) {
     private var job: Job? = null
 
@@ -75,6 +76,7 @@ class XrVideoClient(
                             continue
                         }
                         val bmp = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size, opts) ?: continue
+                        onFrameSize(bmp.width, bmp.height)
                         pipeline.pushBitmap(bmp)
                         decoded++
                         if (decoded == 1 || (decoded % 240 == 0 && dropped > 0)) {

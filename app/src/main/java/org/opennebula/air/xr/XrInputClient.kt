@@ -64,6 +64,17 @@ class XrInputClient(
         sendLine(line)
     }
 
+    fun moveRel(dx: Int, dy: Int, buttons: Int = -1) {
+        if (dx == 0 && dy == 0 && buttons < 0) return
+        val b = if (buttons < 0) "" else " $buttons"
+        sendLine("REL $dx $dy$b")
+    }
+
+    fun sendWheel(delta: Int) {
+        if (delta == 0) return
+        sendLine("WHEEL $delta")
+    }
+
     fun click(u: Float, v: Float, button: Int = 0) {
         sendLine("CLICK ${"%.4f".format(u)} ${"%.4f".format(v)} $button")
     }

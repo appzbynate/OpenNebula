@@ -66,7 +66,7 @@ data class SpatialWindow(
         ): SpatialWindow {
             val d = distance.coerceIn(DIST_MIN, DIST_MAX)
             val s = scale.coerceIn(SCALE_MIN, SCALE_MAX)
-            val aspect = contentAspect.coerceIn(0.30f, 2.8f)
+            val aspect = contentAspect.coerceIn(0.30f, 4.0f)
             val width: Float
             val heightM: Float
             if (aspect >= 1f) {

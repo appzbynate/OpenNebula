@@ -747,7 +747,14 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
             contentAspect = when (focusedId.get()) {
                 SCREEN -> screenAspect
                 SpatialBrowser.ID -> SpatialBrowser.ASPECT
-                DESKTOP -> 16f / 9f
+                DESKTOP -> {
+                    val aspect = if (desktopPipeline.bufferW.get() > 0 && desktopPipeline.bufferH.get() > 0) {
+                        desktopPipeline.bufferW.get().toFloat() / desktopPipeline.bufferH.get().toFloat()
+                    } else {
+                        16f / 9f
+                    }
+                    aspect
+                }
                 else -> SpatialLayout.PANEL_W / SpatialLayout.PANEL_H
             },
             yaw = yaw ?: prev.yaw,
@@ -1271,8 +1278,8 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
             }
             return
         }
-        if (handle == null && focusedId.get() == DESKTOP && _cursorY.value <= 1f && remoteDesktop.isConnected()) {
-            remoteDesktop.pointerDown(_cursorX.value, _cursorY.value.coerceIn(0f, 1f))
+        if (handle == null && focusedId.get() == DESKTOP && remoteDesktop.isConnected()) {
+            remoteDesktop.pointerDown(0f, 0f)
             return
         }
         val layer = chrome.hoverLayer.get() ?: chrome.expandedLayer.get()
@@ -1337,9 +1344,7 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
             return
         }
         if (focusedId.get() == DESKTOP && remoteDesktop.isConnected()) {
-            remoteDesktop.pointerUp(_cursorX.value, _cursorY.value.coerceIn(0f, 1f))
-            if (!click) return
-            // pointerUp already released; click path handled
+            remoteDesktop.pointerUp(0f, 0f)
             return
         }
         if (grab == ChromeHandle.CLOSE) {
@@ -1409,6 +1414,21 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
             haptics.onMove(pixels)
             return
         }
+        // Remote Desktop: phone trackpad = relative Windows mouse (laptop-style).
+        if (focusedId.get() == DESKTOP && remoteDesktop.isConnected() && !_moveScreen.value) {
+            if (chrome.hoverHandle.get() != null) {
+                nudgeCursor(dxNorm, dyNorm)
+                updateChromeFromCursor()
+                haptics.onMove(pixels)
+                return
+            }
+            val sens = 1100f
+            val dx = (dxNorm * sens).toInt()
+            val dy = (dyNorm * sens).toInt()
+            remoteDesktop.moveRel(dx, dy)
+            haptics.onMove(pixels)
+            return
+        }
         if (_moveScreen.value) {
             setOffsetX(_offsetX.value + dxNorm * 1.5f)
             setPanelHeight(_panelHeight.value - dyNorm * 0.9f)
@@ -1426,6 +1446,12 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
         val focused = focusedId.get()
         if (focused == SpatialBrowser.ID && browser.running) {
             browser.scrollBy(dxNorm * SpatialBrowser.WIDTH, dyNorm * SpatialBrowser.HEIGHT)
+            return
+        }
+        if (focused == DESKTOP && remoteDesktop.isConnected()) {
+            // Two-finger style: vertical pad scroll → mouse wheel
+            val ticks = (-dyNorm * 8f).toInt()
+            if (ticks != 0) remoteDesktop.wheel(ticks)
             return
         }
         if (focused == HOME && gridOpen.get() && chrome.grabHandle.get() == null) {
@@ -1571,7 +1597,7 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
         }
         if (focusedId.get() == DESKTOP && remoteDesktop.isConnected()) {
             haptics.click()
-            remoteDesktop.click(_cursorX.value, _cursorY.value.coerceIn(0f, 1f))
+            remoteDesktop.trackpadClick()
             return
         }
         haptics.click()

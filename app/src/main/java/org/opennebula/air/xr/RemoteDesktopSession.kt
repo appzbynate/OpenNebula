@@ -57,10 +57,42 @@ class RemoteDesktopSession(
         onFailed = { err ->
             scope.launch(Dispatchers.Main) { failConnect(err) }
         },
+        onFrameSize = { w, h -> applyContentSize(w, h) },
     )
     private val input = XrInputClient(scope = scope, onLog = onLog)
     private var connectJob: Job? = null
     @Volatile private var buttons = 0
+    private var lastContentW = 0
+    private var lastContentH = 0
+
+    /** Native-ish content aspect from stream; rebuilds panel if monitor mode changes. */
+    private fun applyContentSize(pixelW: Int, pixelH: Int) {
+        val w = pixelW.coerceAtLeast(2)
+        val h = pixelH.coerceAtLeast(2)
+        if (w == lastContentW && h == lastContentH) return
+        lastContentW = w
+        lastContentH = h
+        val aspect = w.toFloat() / h.toFloat()
+        val prev = pipeline.pose.get()
+        val scale = if (aspect >= 1f) {
+            (prev.width / SpatialLayout.PANEL_W).coerceIn(SpatialWindow.SCALE_MIN, SpatialWindow.SCALE_MAX)
+        } else {
+            (prev.height / SpatialLayout.PANEL_H).coerceIn(SpatialWindow.SCALE_MIN, SpatialWindow.SCALE_MAX)
+        }
+        pipeline.pose.set(
+            SpatialWindow.fromControls(
+                prev.distance,
+                prev.y,
+                scale,
+                prev.x,
+                aspect,
+                prev.yaw,
+                prev.pitch,
+                prev.roll,
+            ),
+        )
+        onLog("desktop panel ${w}x$h aspect=${"%.3f".format(aspect)}")
+    }
 
     fun openDialog() {
         if (!_ui.value.connected) clearLayer()
@@ -123,9 +155,11 @@ class RemoteDesktopSession(
                     SpatialLayout.PANEL_Y,
                     1.25f,
                     -1.60f,
-                    9f / 16f,
+                    16f / 9f,
                 ),
             )
+            lastContentW = 0
+            lastContentH = 0
             showStatusPanel("Windows Desktop", "Linking to ${host.name}…")
             pipeline.setActive(true)
             input.connect(host.address, host.controlPort)
@@ -145,6 +179,8 @@ class RemoteDesktopSession(
         connectJob?.cancel()
         connectJob = null
         buttons = 0
+        lastContentW = 0
+        lastContentH = 0
         video.stop()
         input.disconnect()
         clearLayer()
@@ -170,16 +206,41 @@ class RemoteDesktopSession(
         input.pointer(u.coerceIn(0f, 1f), v.coerceIn(0f, 1f), buttons, 0)
     }
 
+    /** Laptop-style trackpad: relative mouse deltas in screen pixels. */
+    fun moveRel(dx: Int, dy: Int) {
+        if (!_ui.value.connected) return
+        if (dx == 0 && dy == 0) return
+        input.moveRel(dx, dy, buttons)
+    }
+
+    fun wheel(delta: Int) {
+        if (!_ui.value.connected || delta == 0) return
+        // Absolute PTR at current cursor with wheel — uses GetCursorPos implicitly via move_to_uv skip
+        // Prefer REL+wheel: send PTR with wheel only by reading isn't available; use click path.
+        // Encode wheel via PTR at 0.5,0.5 would jump cursor — bad.
+        // Use: REL 0 0 with separate WHEEL command — add WHEEL line.
+        input.sendWheel(delta)
+    }
+
     fun pointerDown(u: Float, v: Float, button: Int = 0) {
         if (!_ui.value.connected) return
         buttons = buttons or (1 shl button.coerceIn(0, 2))
-        input.pointer(u.coerceIn(0f, 1f), v.coerceIn(0f, 1f), buttons, 0)
+        input.moveRel(0, 0, buttons)
     }
 
     fun pointerUp(u: Float, v: Float, button: Int = 0) {
         if (!_ui.value.connected) return
         buttons = buttons and (1 shl button.coerceIn(0, 2)).inv()
-        input.pointer(u.coerceIn(0f, 1f), v.coerceIn(0f, 1f), buttons, 0)
+        input.moveRel(0, 0, buttons)
+    }
+
+    fun trackpadClick(button: Int = 0) {
+        if (!_ui.value.connected) return
+        val bit = 1 shl button.coerceIn(0, 2)
+        buttons = buttons or bit
+        input.moveRel(0, 0, buttons)
+        buttons = buttons and bit.inv()
+        input.moveRel(0, 0, buttons)
     }
 
     fun click(u: Float, v: Float, button: Int = 0) {

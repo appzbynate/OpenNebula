@@ -27,9 +27,8 @@ data class Orientation(
 }
 
 /**
- * Gyro integrate + rest-bias + Anchor. Soft gravity only after a long still
- * freeze (fixes pitch walk / "apps drifting down") — never during motion, so
- * nod turnarounds do not yank. No prediction / display slerp.
+ * Gyro integrate + rest-bias + Anchor. Rest freeze zeros gyro (no heartbeat).
+ * Accel horizon assist is off — it made world-locked icons slowly crawl/fall.
  */
 class MadgwickImu {
     private val lock = Any()
@@ -152,18 +151,14 @@ class MadgwickImu {
                     } else {
                         lgx = 0f; lgy = 0f; lgz = 0f
                         stillSamples++
-                        if (stillSamples >= STILL_BEFORE_GRAVITY) {
-                            applyGravityOnly(dt, sample.accelMps2)
-                        }
+                        // Rest gravity caused world-locked icons to slowly "fall"
+                        // toward accel horizon; keep freeze-only (no applyGravityOnly).
                         return published()
                     }
                 } else {
                     restExitCount = 0
                     lgx = 0f; lgy = 0f; lgz = 0f
                     stillSamples++
-                    if (stillSamples >= STILL_BEFORE_GRAVITY) {
-                        applyGravityOnly(dt, sample.accelMps2)
-                    }
                     return published()
                 }
             } else {

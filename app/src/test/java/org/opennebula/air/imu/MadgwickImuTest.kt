@@ -16,7 +16,7 @@ class MadgwickImuTest {
     }
 
     @Test
-    fun long_still_gravity_pulls_tipped_pitch_toward_horizon() {
+    fun long_still_does_not_gravity_pull_pitch() {
         val filter = MadgwickImu()
         var pose = Orientation.IDENTITY
         repeat(MadgwickImu.WARMUP_SAMPLES) { i -> pose = filter.update(lookSample(i, 0f, 0f, 0f)) }
@@ -29,7 +29,9 @@ class MadgwickImuTest {
         for (i in t0 + 300 until t0 + 300 + MadgwickImu.STILL_BEFORE_GRAVITY + 2500) {
             pose = filter.update(lookSample(i, 0f, 0f, 0f))
         }
-        assertTrue(abs(pose.pitchDeg) < abs(tipped) - 3f)
+        // Rest freeze holds pose — no accel horizon crawl (that looked like icons falling).
+        assertEquals(tipped, pose.pitchDeg, 1.5f)
+        assertEquals(0f, filter.lastGain(), 0f)
     }
 
     @Test

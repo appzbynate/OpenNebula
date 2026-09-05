@@ -12,8 +12,8 @@ android {
         applicationId = "org.opennebula.air"
         minSdk = 26
         targetSdk = 35
-        versionCode = 129
-        versionName = "0.9.39-desktop"
+        versionCode = 130
+        versionName = "0.9.40-desktop"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
