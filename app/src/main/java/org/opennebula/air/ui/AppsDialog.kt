@@ -106,6 +106,7 @@ fun AppsDialog(
                             detail = when {
                                 ShellApps.isScreen(item.component) -> "Phone mirror"
                                 ShellApps.isSteamVr(item.component) -> "PC SteamVR bridge"
+                                ShellApps.isDesktop(item.component) -> "Windows desktop (clickable)"
                                 else -> "App grid"
                             },
                             pinned = on,

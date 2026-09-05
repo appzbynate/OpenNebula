@@ -16,6 +16,8 @@ object XrBridgeProtocol {
     const val POSE_PORT = 38401
     const val VIDEO_PORT = 38402
     const val CONTROL_PORT = 38403
+    /** Primary-monitor MJPEG for floating Remote Desktop panel. */
+    const val DESKTOP_VIDEO_PORT = 38404
 
     /** Beacon: ONXR|1|<hostname>|<posePort>|<videoPort>|<controlPort> */
     fun parseBeacon(text: String): XrHost? {

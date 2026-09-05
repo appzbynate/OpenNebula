@@ -57,6 +57,7 @@ import org.opennebula.air.shell.WindowChrome
 import org.opennebula.air.shell.WindowChromeState
 import org.opennebula.air.usb.GlassesConnectionState
 import org.opennebula.air.usb.NrealAirUsbClient
+import org.opennebula.air.xr.RemoteDesktopSession
 import org.opennebula.air.xr.SteamVrSession
 import org.opennebula.air.xr.XrHost
 import java.util.concurrent.atomic.AtomicLong
@@ -122,6 +123,19 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
         },
     )
     val steamVrUi = steamVr.ui
+    val desktopPipeline = MirrorPipeline()
+    private val remoteDesktop = RemoteDesktopSession(
+        context = getApplication(),
+        scope = viewModelScope,
+        pipeline = desktopPipeline,
+        onLog = { appendLog(LogTags.UI, it) },
+        onExitToHome = {
+            viewModelScope.launch(Dispatchers.Main) {
+                showGrid()
+            }
+        },
+    )
+    val remoteDesktopUi = remoteDesktop.ui
     private val worldLock = AtomicBoolean(false)
     private val poseLock = Any()
     private val autoAnchored = AtomicBoolean(false)
@@ -159,6 +173,7 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
         gridPose = windowRef,
         browser = browser.pipeline,
         steamVr = steamVrPipeline,
+        desktop = desktopPipeline,
         onLog = { tag, message -> appendLog(tag, message) },
     )
     val displayStatus: StateFlow<GlassesDisplayStatus> = displays.status
@@ -732,6 +747,7 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
             contentAspect = when (focusedId.get()) {
                 SCREEN -> screenAspect
                 SpatialBrowser.ID -> SpatialBrowser.ASPECT
+                DESKTOP -> 16f / 9f
                 else -> SpatialLayout.PANEL_W / SpatialLayout.PANEL_H
             },
             yaw = yaw ?: prev.yaw,
@@ -741,6 +757,8 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
         when (focusedId.get()) {
             SCREEN -> mirror.pose.set(window)
             SpatialBrowser.ID -> browser.pose.set(window)
+            DESKTOP -> desktopPipeline.pose.set(window)
+            STEAMVR -> steamVrPipeline.pose.set(window)
             HOME -> {
                 windowRef.set(
                     window.copy(
@@ -761,6 +779,7 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
             SCREEN -> if (mirror.enabled.get()) mirror.pose.get() else SpatialWindow()
             SpatialBrowser.ID -> browser.pose.get()
             STEAMVR -> if (steamVrPipeline.enabled.get()) steamVrPipeline.pose.get() else SpatialWindow()
+            DESKTOP -> if (desktopPipeline.enabled.get()) desktopPipeline.pose.get() else SpatialWindow()
             else -> if (gridOpen.get()) windowRef.get() else focusedLayer().pose.get()
         }
     }
@@ -840,6 +859,28 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
             _offsetX.value = pose.x
             _cursorX.value = mirror.cursorX.get()
             _cursorY.value = mirror.cursorY.get()
+            return
+        }
+        if (id == DESKTOP) {
+            focusedId.set(DESKTOP)
+            _focused.value = DESKTOP
+            val pose = desktopPipeline.pose.get()
+            _distance.value = pose.distance
+            _panelHeight.value = pose.y
+            _panelScale.value = pose.width / SpatialLayout.PANEL_W
+            _offsetX.value = pose.x
+            _cursorX.value = desktopPipeline.cursorX.get()
+            _cursorY.value = desktopPipeline.cursorY.get()
+            return
+        }
+        if (id == STEAMVR) {
+            focusedId.set(STEAMVR)
+            _focused.value = STEAMVR
+            val pose = steamVrPipeline.pose.get()
+            _distance.value = pose.distance
+            _panelHeight.value = pose.y
+            _panelScale.value = pose.width / SpatialLayout.PANEL_W
+            _offsetX.value = pose.x
             return
         }
         val layer = layers.firstOrNull { it.id == id } ?: return
@@ -923,6 +964,11 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
             openSteamVr()
             return
         }
+        if (ShellApps.isDesktop(component)) {
+            haptics.click()
+            openRemoteDesktop()
+            return
+        }
         val web = WebApps.find(component)
         if (web == null) {
             appendLog(LogTags.UI, "unknown app $component")
@@ -966,6 +1012,37 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
         showGrid()
     }
 
+    fun openRemoteDesktop() {
+        browser.cancelPointer()
+        collapseChrome()
+        if (remoteDesktop.isConnected()) {
+            focus(DESKTOP)
+            gridOpen.set(false)
+            displays.requestFrameNow()
+            return
+        }
+        remoteDesktop.openDialog()
+    }
+
+    fun closeRemoteDesktopDialog() = remoteDesktop.closeDialog()
+    fun selectRemoteDesktopHost(host: XrHost) = remoteDesktop.select(host)
+    fun setRemoteDesktopIp(ip: String) = remoteDesktop.setManualIp(ip)
+    fun connectRemoteDesktop() {
+        remoteDesktop.connect()
+        viewModelScope.launch {
+            val state = remoteDesktop.ui.first { !it.busy }
+            if (state.connected) {
+                gridOpen.set(false)
+                focus(DESKTOP)
+                displays.requestFrameNow()
+            }
+        }
+    }
+    fun disconnectRemoteDesktop() {
+        remoteDesktop.disconnect()
+        showGrid()
+    }
+
     fun closeBrowser() {
         closeFocusedWindow()
     }
@@ -976,6 +1053,7 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
             SpatialBrowser.ID -> browser.stop()
             SCREEN -> stopMirroring()
             STEAMVR -> steamVr.disconnect()
+            DESKTOP -> remoteDesktop.disconnect()
         }
         collapseChrome()
         val remaining = windowList()
@@ -1011,6 +1089,7 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
                 val bmp = when {
                     ShellApps.isScreen(shell.component) -> BrandIcons.screenMirror()
                     ShellApps.isSteamVr(shell.component) -> BrandIcons.steamVr()
+                    ShellApps.isDesktop(shell.component) -> BrandIcons.remoteDesktop()
                     else -> BrandIcons.extendedDisplay()
                 }
                 apps += IconSource(shell.component, bmp, name = shell.name)
@@ -1146,6 +1225,9 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
             iconGrid.hoverComponent.set(null)
             if (focusedId.get() != panelHit.layerId) focus(panelHit.layerId)
             setCursor(panelHit.u, panelHit.v)
+            if (panelHit.layerId == DESKTOP && remoteDesktop.isConnected()) {
+                remoteDesktop.movePointer(panelHit.u, panelHit.v.coerceIn(0f, 1f))
+            }
             val travel = hypot(panelHit.u - lastPointerU, panelHit.v - lastPointerV) * 420f
             haptics.onMove(travel)
             lastPointerU = panelHit.u
@@ -1189,6 +1271,10 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
             }
             return
         }
+        if (handle == null && focusedId.get() == DESKTOP && _cursorY.value <= 1f && remoteDesktop.isConnected()) {
+            remoteDesktop.pointerDown(_cursorX.value, _cursorY.value.coerceIn(0f, 1f))
+            return
+        }
         val layer = chrome.hoverLayer.get() ?: chrome.expandedLayer.get()
         if (!chrome.canGrab(handle, layer)) return
         if (handle != null && layer != null) {
@@ -1223,6 +1309,9 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
             if (!pointerActive()) phonePointer?.stop()
         }
         browser.cancelPointer()
+        if (remoteDesktop.isConnected()) {
+            remoteDesktop.pointerUp(_cursorX.value, _cursorY.value.coerceIn(0f, 1f))
+        }
     }
 
     fun padUp(click: Boolean) {
@@ -1245,6 +1334,12 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
                 _cursorX.value,
                 _cursorY.value.coerceIn(0f, 1f),
             )
+            return
+        }
+        if (focusedId.get() == DESKTOP && remoteDesktop.isConnected()) {
+            remoteDesktop.pointerUp(_cursorX.value, _cursorY.value.coerceIn(0f, 1f))
+            if (!click) return
+            // pointerUp already released; click path handled
             return
         }
         if (grab == ChromeHandle.CLOSE) {
@@ -1443,6 +1538,9 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
         } else if (focusedId.get() == SpatialBrowser.ID) {
             browser.cursorX.set(x)
             browser.cursorY.set(panelV)
+        } else if (focusedId.get() == DESKTOP) {
+            desktopPipeline.cursorX.set(x)
+            desktopPipeline.cursorY.set(panelV)
         } else {
             val fb = focusedLayer().panel
             fb.cursorX.set(x)
@@ -1471,6 +1569,11 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
             )
             return
         }
+        if (focusedId.get() == DESKTOP && remoteDesktop.isConnected()) {
+            haptics.click()
+            remoteDesktop.click(_cursorX.value, _cursorY.value.coerceIn(0f, 1f))
+            return
+        }
         haptics.click()
         tapHandler?.invoke(_cursorX.value, _cursorY.value.coerceIn(0f, 1f))
     }
@@ -1481,13 +1584,15 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
         return buildList {
             if (browser.running) add(SpatialBrowser.ID to browser.pose.get())
             if (mirror.enabled.get()) add(SCREEN to mirror.pose.get())
-            if (steamVrPipeline.enabled.get()) add(STEAMVR to steamVrPipeline.pose.get())
+            if (desktopPipeline.enabled.get()) add(DESKTOP to desktopPipeline.pose.get())
+            // SteamVR immersive is not a pickable floating panel.
         }
     }
 
     private fun windowOf(id: String): SpatialWindow? {
         if (id == SCREEN) return if (mirror.enabled.get()) mirror.pose.get() else null
         if (id == SpatialBrowser.ID) return if (browser.running) browser.pose.get() else null
+        if (id == DESKTOP) return if (desktopPipeline.enabled.get()) desktopPipeline.pose.get() else null
         if (id == STEAMVR) return if (steamVrPipeline.enabled.get()) steamVrPipeline.pose.get() else null
         return layers.firstOrNull { it.id == id }?.pose?.get()
     }
@@ -1633,6 +1738,7 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
         stopMirroring()
         browser.stop()
         steamVr.disconnect()
+        remoteDesktop.disconnect()
         phonePointer?.stop()
         phonePointer = null
         pointerBeam.set(PointerBeam(0f, 0f, -2f, false))
@@ -1648,6 +1754,7 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
         const val NOTES = "notes"
         const val SCREEN = MirrorPipeline.ID
         const val STEAMVR = MirrorPipeline.STEAMVR_ID
+        const val DESKTOP = MirrorPipeline.DESKTOP_ID
         const val BROWSER = SpatialBrowser.ID
     }
 }

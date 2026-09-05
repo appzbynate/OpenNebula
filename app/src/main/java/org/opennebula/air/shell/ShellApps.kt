@@ -12,6 +12,7 @@ object ShellApps {
     const val SCREEN = "shell:screen"
     const val EXTENDED = "shell:extended"
     const val STEAMVR = "shell:steamvr"
+    const val DESKTOP = "shell:desktop"
 
     data class Item(
         val id: String,
@@ -24,6 +25,7 @@ object ShellApps {
         Item("screen", "Screen"),
         Item("extended", "Extended Display"),
         Item("steamvr", "SteamVR"),
+        Item("desktop", "Remote Desktop"),
     )
 
     fun isComponent(component: String): Boolean = component.trim().startsWith(PREFIX)
@@ -41,6 +43,11 @@ object ShellApps {
     fun isSteamVr(component: String): Boolean {
         val t = component.trim()
         return t == STEAMVR || t == MirrorPipeline.STEAMVR_ID || t == "steamvr"
+    }
+
+    fun isDesktop(component: String): Boolean {
+        val t = component.trim()
+        return t == DESKTOP || t == MirrorPipeline.DESKTOP_ID || t == "desktop"
     }
 
     fun launcherIds(): List<String> {

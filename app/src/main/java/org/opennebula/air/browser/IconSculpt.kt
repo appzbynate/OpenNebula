@@ -34,13 +34,14 @@ object IconSculpt {
     )
 
     enum class Glyph {
-        SCREEN, EXTENDED, STEAMVR, YOUTUBE, PARSEC, TWITCH, DISCORD,
+        SCREEN, EXTENDED, STEAMVR, DESKTOP, YOUTUBE, PARSEC, TWITCH, DISCORD,
         SPOTIFY, REDDIT, XBOX, CHATGPT, PLEX, GOOGLE, LETTER,
     }
 
     fun screen(): Bitmap = bitmap(Spec(0.22f, 0.86f, 0.78f, 0.52f, 0.46f, 0.07f, Glyph.SCREEN))
     fun extended(): Bitmap = bitmap(Spec(0.45f, 0.70f, 0.98f, 0.54f, 0.40f, 0.07f, Glyph.EXTENDED))
     fun steamVr(): Bitmap = bitmap(Spec(0.10f, 0.12f, 0.16f, 0.54f, 0.40f, 0.07f, Glyph.STEAMVR))
+    fun remoteDesktop(): Bitmap = bitmap(Spec(0.12f, 0.42f, 0.78f, 0.54f, 0.40f, 0.07f, Glyph.DESKTOP))
 
     fun web(item: WebAppItem): Bitmap {
         val c = item.color
@@ -308,6 +309,13 @@ object IconSculpt {
                 val bar = Paint(fill).apply { strokeWidth = size * 0.045f; style = Paint.Style.STROKE }
                 canvas.drawLine(cx - s * 0.34f, cy - s * 0.34f, cx - s * 0.10f, cy - s * 0.34f, bar)
                 canvas.drawLine(cx + s * 0.06f, cy - s * 0.34f, cx + s * 0.34f, cy - s * 0.34f, bar)
+            }
+            Glyph.DESKTOP -> {
+                val frame = RectF(cx - s * 0.36f, cy - s * 0.28f, cx + s * 0.36f, cy + s * 0.18f)
+                canvas.drawRoundRect(frame, s * 0.06f, s * 0.06f, stroke)
+                canvas.drawRect(cx - s * 0.30f, cy - s * 0.22f, cx + s * 0.30f, cy + s * 0.08f, fill)
+                canvas.drawRect(cx - s * 0.10f, cy + s * 0.18f, cx + s * 0.10f, cy + s * 0.28f, fill)
+                canvas.drawRect(cx - s * 0.22f, cy + s * 0.28f, cx + s * 0.22f, cy + s * 0.34f, fill)
             }
             Glyph.PARSEC -> {
                 val pad = RectF(cx - s * 0.38f, cy - s * 0.20f, cx + s * 0.38f, cy + s * 0.20f)

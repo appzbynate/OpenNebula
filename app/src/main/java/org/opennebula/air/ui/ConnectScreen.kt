@@ -81,6 +81,7 @@ fun ConnectScreen(viewModel: GlassesViewModel) {
     val pinnedIds by viewModel.pinnedIds.collectAsStateWithLifecycle()
     val calibration by viewModel.calibration.collectAsStateWithLifecycle()
     val steamVr by viewModel.steamVrUi.collectAsStateWithLifecycle()
+    val remoteDesktop by viewModel.remoteDesktopUi.collectAsStateWithLifecycle()
     var showSettings by remember { mutableStateOf(false) }
     var showApps by remember { mutableStateOf(false) }
     Box(Modifier.fillMaxSize()) {
@@ -167,6 +168,16 @@ fun ConnectScreen(viewModel: GlassesViewModel) {
                 onConnect = viewModel::connectSteamVr,
                 onDisconnect = viewModel::disconnectSteamVr,
                 onClose = viewModel::closeSteamVrDialog,
+            )
+        }
+        if (remoteDesktop.open) {
+            RemoteDesktopDialog(
+                state = remoteDesktop,
+                onSelect = viewModel::selectRemoteDesktopHost,
+                onManualIp = viewModel::setRemoteDesktopIp,
+                onConnect = viewModel::connectRemoteDesktop,
+                onDisconnect = viewModel::disconnectRemoteDesktop,
+                onClose = viewModel::closeRemoteDesktopDialog,
             )
         }
         if (inputMode != InputMode.CONTROLS && !promptConnectMode) {

@@ -269,6 +269,7 @@ class MirrorPipeline {
     companion object {
         const val ID = "screen"
         const val STEAMVR_ID = "steamvr"
+        const val DESKTOP_ID = "desktop"
         private const val OPAQUE = 0xFF000000.toInt()
 
         fun opaqueArgb(r: Int, g: Int, b: Int): Int {

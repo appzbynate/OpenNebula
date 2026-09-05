@@ -25,6 +25,7 @@ DISCOVERY_PORT = 38400
 POSE_PORT = 38401
 VIDEO_PORT = 38402
 CONTROL_PORT = 38403
+DESKTOP_VIDEO_PORT = 38404
 OPENTRACK_PORT = 4242
 
 
@@ -229,7 +230,14 @@ def pose_loop(stop: threading.Event, opentrack: bool, pose_map: str = "legacy") 
 
 
 def control_loop(stop: threading.Event) -> None:
-    """Phone sends LAUNCH / HELLO on TCP :38403 → start SteamVR + HMD driver."""
+    """Persistent line protocol on TCP :38403.
+
+    LAUNCH / HELLO  → SteamVR + HMD driver
+    DESKTOP         → warm desktop capture, OK
+    PTR u v buttons [wheel]  → mouse (u,v in 0..1 on primary)
+    CLICK u v [button]
+    KEY down|up vk
+    """
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
@@ -237,9 +245,57 @@ def control_loop(stop: threading.Event) -> None:
     except OSError as err:
         print(f"[control] FATAL cannot bind :{CONTROL_PORT}: {err}")
         return
-    server.listen(2)
+    server.listen(4)
     server.settimeout(1.0)
-    print(f"[control] TCP listening 0.0.0.0:{CONTROL_PORT} (LAUNCH → SteamVR + HMD)")
+    print(f"[control] TCP listening 0.0.0.0:{CONTROL_PORT} (LAUNCH / DESKTOP / PTR)")
+
+    def handle_line(line: str, conn: socket.socket) -> None:
+        raw = line.strip()
+        if not raw:
+            return
+        upper = raw.upper()
+        if upper.startswith("LAUNCH") or upper.startswith("HELLO"):
+            msg = activate_headset_session()
+            print(f"[hmd] {msg}")
+            conn.sendall(b"OK SteamVR launching\n")
+            return
+        if upper.startswith("DESKTOP"):
+            from desktop_capture import primary_monitor_size, capture_note
+
+            primary_monitor_size()
+            print(f"[desktop] {capture_note()}")
+            conn.sendall(b"OK desktop ready\n")
+            return
+        parts = raw.split()
+        cmd = parts[0].upper()
+        try:
+            import win_input
+        except Exception as err:
+            conn.sendall(f"ERR input {err}\n".encode("utf-8"))
+            return
+        try:
+            if cmd == "PTR" and len(parts) >= 4:
+                u = float(parts[1])
+                v = float(parts[2])
+                buttons = int(float(parts[3]))
+                wheel = int(float(parts[4])) if len(parts) >= 5 else 0
+                win_input.pointer(u, v, buttons, wheel)
+            elif cmd == "CLICK" and len(parts) >= 3:
+                u = float(parts[1])
+                v = float(parts[2])
+                button = int(float(parts[3])) if len(parts) >= 4 else 0
+                win_input.click(u, v, button)
+            elif cmd == "KEY" and len(parts) >= 3:
+                down = parts[1].lower() in ("down", "1", "d")
+                vk = int(parts[2], 0)
+                win_input.key(vk, down)
+            else:
+                conn.sendall(b"ERR unknown\n")
+                return
+        except Exception as err:
+            print(f"[control] input error: {err}")
+            conn.sendall(f"ERR {err}\n".encode("utf-8"))
+
     while not stop.is_set():
         try:
             conn, addr = server.accept()
@@ -247,67 +303,83 @@ def control_loop(stop: threading.Event) -> None:
             continue
         except OSError:
             break
-        try:
-            conn.settimeout(2.0)
-            raw = conn.recv(256).decode("utf-8", errors="ignore").strip().upper()
-            print(f"[control] {addr[0]} → {raw or '(empty)'}")
-            if raw.startswith("LAUNCH") or raw.startswith("HELLO") or raw == "":
-                msg = activate_headset_session()
-                print(f"[hmd] {msg}")
-                conn.sendall(b"OK SteamVR launching\n")
-            else:
-                conn.sendall(b"ERR unknown\n")
-        except OSError as err:
-            print(f"[control] client error: {err}")
-        finally:
-            conn.close()
+        threading.Thread(
+            target=_control_client,
+            args=(conn, addr, stop, handle_line),
+            daemon=True,
+            name="xr-control-client",
+        ).start()
     server.close()
 
 
-def video_loop(stop: threading.Event, fps: float, quality: int) -> None:
+def _control_client(conn: socket.socket, addr, stop: threading.Event, handle_line) -> None:
+    print(f"[control] client {addr[0]}")
+    conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    conn.settimeout(1.0)
+    buf = ""
+    try:
+        while not stop.is_set():
+            try:
+                chunk = conn.recv(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk.decode("utf-8", errors="ignore")
+            while "\n" in buf:
+                line, buf = buf.split("\n", 1)
+                handle_line(line, conn)
+    except OSError as err:
+        print(f"[control] client error: {err}")
+    finally:
+        try:
+            import win_input
+            win_input.release_all()
+        except Exception:
+            pass
+        conn.close()
+        print(f"[control] client {addr[0]} gone")
+
+
+def _latest_frame_server(
+    stop: threading.Event,
+    port: int,
+    label: str,
+    grab_fn,
+    fps: float,
+    quality: int,
+) -> None:
+    """Shared latest-frame MJPEG TCP server (SteamVR + desktop)."""
     global video_clients
-    # ALWAYS bind — phone probes this port before connecting.
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
-        server.bind(("0.0.0.0", VIDEO_PORT))
+        server.bind(("0.0.0.0", port))
     except OSError as err:
-        print(f"[video] FATAL cannot bind :{VIDEO_PORT}: {err}")
+        print(f"[{label}] FATAL cannot bind :{port}: {err}")
         return
     server.listen(2)
     server.settimeout(1.0)
-    has_cap = grab_steamvr_or_desktop_jpeg(quality) is not None
-    try:
-        from steamvr_capture import ensure_steamvr_mirror, find_capture_rect
-        mirror_msg = ensure_steamvr_mirror()
-        _rect, cap_note = find_capture_rect()
-    except Exception as err:
-        mirror_msg = str(err)
-        cap_note = "capture helper unavailable"
-    print(f"[video] TCP listening 0.0.0.0:{VIDEO_PORT}")
-    print(f"[video] {mirror_msg}")
-    print(f"[video] {cap_note}  live_steamvr_frame={'yes' if has_cap else 'no — showing lobby until Mirror is visible'}")
     lobby = make_vr_lobby_jpeg()
-    # fps<=0 → uncapped (send as fast as capture/encode allows).
     period = 0.0 if fps <= 0 else 1.0 / max(fps, 1.0)
-    print(f"[video] target={'uncapped' if period <= 0 else f'{fps:.0f} fps'} quality={quality}")
-    print("[video] latest-frame pipeline (capture never waits on Wi‑Fi send)")
+    print(f"[{label}] TCP listening 0.0.0.0:{port}  target={'uncapped' if period <= 0 else f'{fps:.0f} fps'} q={quality}")
     while not stop.is_set():
         try:
             conn, addr = server.accept()
         except socket.timeout:
             continue
+        except OSError:
+            break
         video_clients += 1
-        print(f"[video] phone connected from {addr[0]} — immersive stream")
+        print(f"[{label}] phone connected from {addr[0]}")
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         try:
             try:
-                # Tiny send buffer — prefer drop/block over queuing old frames.
                 conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 64 * 1024)
             except OSError:
                 pass
-
-            # Capture thread always overwrites "latest"; sender only ships newest.
             latest_jpeg: list[bytes | None] = [lobby]
             latest_lock_v = threading.Lock()
             gen = [0]
@@ -316,7 +388,7 @@ def video_loop(stop: threading.Event, fps: float, quality: int) -> None:
             def capture_worker() -> None:
                 while not stop.is_set() and not conn_stop.is_set():
                     t0 = time.time()
-                    jpeg = grab_steamvr_or_desktop_jpeg(quality) or lobby
+                    jpeg = grab_fn(quality) or lobby
                     with latest_lock_v:
                         latest_jpeg[0] = jpeg
                         gen[0] += 1
@@ -327,7 +399,7 @@ def video_loop(stop: threading.Event, fps: float, quality: int) -> None:
                     else:
                         time.sleep(0.0)
 
-            cap_t = threading.Thread(target=capture_worker, name="xr-capture", daemon=True)
+            cap_t = threading.Thread(target=capture_worker, name=f"{label}-cap", daemon=True)
             cap_t.start()
             sent_gen = -1
             try:
@@ -344,10 +416,40 @@ def video_loop(stop: threading.Event, fps: float, quality: int) -> None:
             finally:
                 conn_stop.set()
         except OSError as err:
-            print(f"[video] phone disconnected: {err}")
+            print(f"[{label}] phone disconnected: {err}")
         finally:
             conn.close()
     server.close()
+
+
+def video_loop(stop: threading.Event, fps: float, quality: int) -> None:
+    has_cap = grab_steamvr_or_desktop_jpeg(quality) is not None
+    try:
+        from steamvr_capture import ensure_steamvr_mirror, find_capture_rect
+        mirror_msg = ensure_steamvr_mirror()
+        _rect, cap_note = find_capture_rect()
+    except Exception as err:
+        mirror_msg = str(err)
+        cap_note = "capture helper unavailable"
+    print(f"[video] {mirror_msg}")
+    print(f"[video] {cap_note}  live_steamvr_frame={'yes' if has_cap else 'no — lobby until Mirror visible'}")
+
+    def grab(q: int):
+        return grab_steamvr_or_desktop_jpeg(q)
+
+    _latest_frame_server(stop, VIDEO_PORT, "video", grab, fps, quality)
+
+
+def desktop_video_loop(stop: threading.Event, fps: float, quality: int) -> None:
+    from desktop_capture import grab_desktop_jpeg, primary_monitor_size, capture_note
+
+    primary_monitor_size()
+    print(f"[desktop] {capture_note()}")
+
+    def grab(q: int):
+        return grab_desktop_jpeg(quality=q, max_w=1280)
+
+    _latest_frame_server(stop, DESKTOP_VIDEO_PORT, "desktop", grab, fps, quality)
 
 
 def main() -> None:
@@ -377,18 +479,23 @@ def main() -> None:
     ]
     if not args.no_video:
         threads.append(threading.Thread(target=video_loop, args=(stop, args.fps, args.quality), daemon=True))
+        # Desktop panel: slightly higher JPEG quality is fine at 1280px; still uncapped.
+        desk_q = min(max(args.quality + 10, 40), 55)
+        threads.append(
+            threading.Thread(target=desktop_video_loop, args=(stop, args.fps, desk_q), daemon=True),
+        )
     for t in threads:
         t.start()
     time.sleep(0.3)
     lan = [ip for ip in local_ips() if ip.startswith("192.168.") or (ip.startswith("10.") and not ip.startswith("10.5."))]
     print("=" * 60)
     print("  OpenNebula XR Bridge RUNNING — leave this window open")
-    print("  Phone → SteamVR → 192.168.x IP below → Go")
+    print("  Phone → SteamVR  OR  Remote Desktop → PC IP → Go")
     print(f"  Pose map: {args.pose_map}  ({POSE_MAPS[args.pose_map]})  log: pose_axis.csv")
-    print("  On Go: installs OpenTrack HMD driver, launches SteamVR, streams Home/Mirror")
+    print("  SteamVR: immersive SBS on :%d   Desktop: floating panel on :%d" % (VIDEO_PORT, DESKTOP_VIDEO_PORT))
     for ip in (lan or local_ips() or ["(run ipconfig)"]):
         print(f"      {ip}")
-    print(f"  Ports: UDP {DISCOVERY_PORT}/{POSE_PORT}  TCP {VIDEO_PORT}/{CONTROL_PORT}")
+    print(f"  Ports: UDP {DISCOVERY_PORT}/{POSE_PORT}  TCP {VIDEO_PORT}/{CONTROL_PORT}/{DESKTOP_VIDEO_PORT}")
     print("=" * 60)
     try:
         while True:

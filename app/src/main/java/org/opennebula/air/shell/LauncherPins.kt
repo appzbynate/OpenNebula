@@ -12,6 +12,7 @@ object LauncherPins {
         ShellApps.SCREEN,
         ShellApps.EXTENDED,
         ShellApps.STEAMVR,
+        ShellApps.DESKTOP,
         WebApps.component("youtube"),
         WebApps.component("parsec"),
         WebApps.component("twitch"),

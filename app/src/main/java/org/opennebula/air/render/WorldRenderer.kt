@@ -47,6 +47,7 @@ class WorldRenderer(
     private val gridPose: AtomicReference<SpatialWindow>,
     private val browser: MirrorPipeline,
     private val steamVr: MirrorPipeline,
+    private val desktop: MirrorPipeline,
 ) : GLSurfaceView.Renderer {
     private var colorProg = 0
     private var texProg = 0
@@ -84,6 +85,8 @@ class WorldRenderer(
     private var lastBrowserGen = -1
     private var steamVrTex = 0
     private var lastSteamVrGen = -1
+    private var desktopTex = 0
+    private var lastDesktopGen = -1
     private lateinit var mirrorPanelTris: FloatBuffer
     private var mirrorPanelCount = 0
     private lateinit var mirrorBezelTris: FloatBuffer
@@ -98,6 +101,11 @@ class WorldRenderer(
     private lateinit var steamVrBezelTris: FloatBuffer
     private var steamVrBezelCount = 0
     private var lastSteamVrPose: SpatialWindow? = null
+    private lateinit var desktopPanelTris: FloatBuffer
+    private var desktopPanelCount = 0
+    private lateinit var desktopBezelTris: FloatBuffer
+    private var desktopBezelCount = 0
+    private var lastDesktopPose: SpatialWindow? = null
     /** NDC fullscreen quad for immersive SteamVR (no floating AR panel). */
     private lateinit var immersiveQuad: FloatBuffer
     private var immersiveQuadCount = 0
@@ -170,6 +178,7 @@ class WorldRenderer(
         mirrorTex = genTex()
         browserTex = genTex()
         steamVrTex = genTex()
+        desktopTex = genTex()
         val mp = mirror.pose.get()
         lastMirrorPose = mp
         mirrorBezelTris = pack(buildBezel(mp))
@@ -188,6 +197,12 @@ class WorldRenderer(
         steamVrBezelCount = steamVrBezelTris.capacity() / COLOR_STRIDE
         steamVrPanelTris = packUv(buildPanel(sp))
         steamVrPanelCount = steamVrPanelTris.capacity() / UV_STRIDE
+        val dp = desktop.pose.get()
+        lastDesktopPose = dp
+        desktopBezelTris = pack(buildBezel(dp))
+        desktopBezelCount = desktopBezelTris.capacity() / COLOR_STRIDE
+        desktopPanelTris = packUv(buildPanel(dp))
+        desktopPanelCount = desktopPanelTris.capacity() / UV_STRIDE
         // Fullscreen NDC: x,y,z,u,v — covers the eye viewport.
         immersiveQuad = packUv(
             listOf(
@@ -237,6 +252,7 @@ class WorldRenderer(
         uploadMirror()
         uploadBrowser()
         uploadSteamVr()
+        uploadDesktop()
         uploadIcons()
         // Raw fusion → view (motion-smooth 0.8.93 caused complaint; restore baseline display).
         // Tag baseline-0.8.92 remains the full restore point.
@@ -331,7 +347,7 @@ class WorldRenderer(
             drawIcons(mvp)
         }
         drawWindows(mvp)
-        val hasWindow = browser.enabled.get() || mirror.enabled.get()
+        val hasWindow = browser.enabled.get() || mirror.enabled.get() || desktop.enabled.get()
         if (hasWindow) {
             placeCursor()
             drawColor(mvp, cursorTris, cursorCount, GLES20.GL_TRIANGLES)
@@ -379,6 +395,13 @@ class WorldRenderer(
                 steamVrTex, steamVrPanelTris, steamVrPanelCount,
             )
         }
+        if (desktop.enabled.get() && lastDesktopGen > 0) {
+            passes += Pass(
+                desktop.pose.get().z,
+                desktopBezelTris, desktopBezelCount,
+                desktopTex, desktopPanelTris, desktopPanelCount,
+            )
+        }
         if (passes.isEmpty()) return
         passes.sortBy { it.z }
         GLES20.glDepthMask(true)
@@ -392,6 +415,7 @@ class WorldRenderer(
         if (id == SpatialBrowser.ID && browser.enabled.get()) return browser.pose.get()
         if (id == MirrorPipeline.ID && mirror.enabled.get()) return mirror.pose.get()
         if (id == MirrorPipeline.STEAMVR_ID && steamVr.enabled.get()) return steamVr.pose.get()
+        if (id == MirrorPipeline.DESKTOP_ID && desktop.enabled.get()) return desktop.pose.get()
         if (gridOpen.get()) return gridPose.get()
         return layers.firstOrNull { it.id == id }?.pose?.get() ?: gridPose.get()
     }
@@ -485,6 +509,30 @@ class WorldRenderer(
             val panel = buildPanel(pose)
             writeUv(steamVrPanelTris, panel)
             steamVrPanelCount = minOf(panel.size, steamVrPanelTris.capacity()) / UV_STRIDE
+        }
+    }
+
+    private fun uploadDesktop() {
+        if (!desktop.enabled.get()) return
+        val gen = desktop.generation.get()
+        if (gen != lastDesktopGen) {
+            var uploaded = false
+            desktop.withBitmap { bmp ->
+                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, desktopTex)
+                GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
+                uploaded = true
+            }
+            if (uploaded) lastDesktopGen = gen
+        }
+        val pose = desktop.pose.get()
+        if (pose != lastDesktopPose) {
+            lastDesktopPose = pose
+            val bezel = buildBezel(pose)
+            write(desktopBezelTris, bezel)
+            desktopBezelCount = minOf(bezel.size, desktopBezelTris.capacity()) / COLOR_STRIDE
+            val panel = buildPanel(pose)
+            writeUv(desktopPanelTris, panel)
+            desktopPanelCount = minOf(panel.size, desktopPanelTris.capacity()) / UV_STRIDE
         }
     }
 
@@ -639,6 +687,11 @@ class WorldRenderer(
                 u = steamVr.cursorX.get()
                 v = steamVr.cursorY.get()
             }
+            id == MirrorPipeline.DESKTOP_ID && desktop.enabled.get() -> {
+                window = desktop.pose.get()
+                u = desktop.cursorX.get()
+                v = desktop.cursorY.get()
+            }
             else -> {
                 cursorCount = 0
                 return
@@ -695,6 +748,11 @@ class WorldRenderer(
         if (mirror.enabled.get()) {
             appendChrome(
                 data, MirrorPipeline.ID, mirror.pose.get(), hoverLayer, hoverHandle, grab, focus, expandedId,
+            )
+        }
+        if (desktop.enabled.get()) {
+            appendChrome(
+                data, MirrorPipeline.DESKTOP_ID, desktop.pose.get(), hoverLayer, hoverHandle, grab, focus, expandedId,
             )
         }
         // No chrome in immersive SteamVR.
