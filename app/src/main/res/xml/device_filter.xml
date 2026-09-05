@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      vendor-id / product-id must be decimal.
+      0x3318 = 13080, 0x0424 = 1060 (first-gen Nreal Air).
+    -->
+    <usb-device vendor-id="13080" product-id="1060" />
+</resources>
