@@ -29,6 +29,9 @@ class ImuTrace(
     private val summaryFile = File(dir, "imu_summary.txt")
 
     private val lock = Any()
+    private val ioExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "ImuTraceIo").apply { isDaemon = true }
+    }
     private val lines = ArrayDeque<String>(MAX + 8)
     private val events = ArrayDeque<String>(EVENT_MAX + 8)
     private val seq = AtomicInteger(0)
@@ -243,8 +246,7 @@ class ImuTrace(
             if (lines.size >= MAX) lines.removeFirst()
             lines.addLast(line)
             if (n % FLUSH_EVERY == 0) {
-                writeTraceLocked()
-                writeEventsLocked()
+                scheduleWriteLocked()
             }
         }
 
@@ -279,8 +281,7 @@ class ImuTrace(
 
     fun flush() {
         synchronized(lock) {
-            writeTraceLocked()
-            writeEventsLocked()
+            scheduleWriteLocked()
         }
         writeSummary(System.currentTimeMillis(), null, null, 0f)
     }
@@ -358,9 +359,11 @@ class ImuTrace(
             appendLine("files=imu_trace.csv,imu_events.csv,imu_summary.txt")
             appendLine("HOW_TO_READ=still_obj_jump=on-screen wobble while gyro quiet; DRIFT=pose moves during rest freeze; REST_CHATTER=freeze gate flapping; GRAV=horizon pull")
         }
-        runCatching {
-            dir.mkdirs()
-            summaryFile.writeText(text)
+        ioExecutor.submit {
+            runCatching {
+                dir.mkdirs()
+                summaryFile.writeText(text)
+            }
         }
         Log.i(LogTags.SUMMARY, text.replace("\n", " · "))
         // Reset event counters each summary window so counts are per-interval.
@@ -370,21 +373,17 @@ class ImuTrace(
         driftEvents = 0
     }
 
-    private fun writeTraceLocked() {
-        runCatching {
-            dir.mkdirs()
-            traceFile.writeText(TRACE_HEADER + lines.joinToString("\n", postfix = "\n"))
-        }.onFailure {
-            Log.w(LogTags.TRACE, "trace write failed ${it.message}")
-        }
-    }
-
-    private fun writeEventsLocked() {
-        runCatching {
-            dir.mkdirs()
-            eventFile.writeText(EVENT_HEADER + events.joinToString("\n", postfix = "\n"))
-        }.onFailure {
-            Log.w(LogTags.TRACE, "events write failed ${it.message}")
+    private fun scheduleWriteLocked() {
+        val traceSnapshot = TRACE_HEADER + lines.joinToString("\n", postfix = "\n")
+        val eventSnapshot = EVENT_HEADER + events.joinToString("\n", postfix = "\n")
+        ioExecutor.submit {
+            runCatching {
+                dir.mkdirs()
+                traceFile.writeText(traceSnapshot)
+                eventFile.writeText(eventSnapshot)
+            }.onFailure {
+                Log.w(LogTags.TRACE, "async trace write failed ${it.message}")
+            }
         }
     }
 

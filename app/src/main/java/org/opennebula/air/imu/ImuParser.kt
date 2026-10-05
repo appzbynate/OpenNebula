@@ -17,14 +17,14 @@ object ImuParser {
 
     fun resetAirAxisMode() = Unit
 
-    fun isAirPackedReport(packet: ByteArray): Boolean {
-        return packet.size >= 2 &&
+    fun isAirPackedReport(packet: ByteArray, length: Int = packet.size): Boolean {
+        return length >= 2 &&
             packet[0] == AirReport.HEADER_0 &&
             packet[1] == AirReport.HEADER_1
     }
 
-    fun isImuControlFrame(packet: ByteArray): Boolean {
-        return packet.isNotEmpty() && packet[0] == 0xAA.toByte()
+    fun isImuControlFrame(packet: ByteArray, length: Int = packet.size): Boolean {
+        return length > 0 && packet[0] == 0xAA.toByte()
     }
 
     fun parseImuControlReply(packet: ByteArray): Pair<Int, ByteArray>? {
@@ -40,9 +40,9 @@ object ImuParser {
      * Auto-selects the packed Air report when the `01 02` header is present,
      * otherwise the MPU6050 16-bit LE placeholder layout.
      */
-    fun parse(packet: ByteArray): ImuSample? {
-        if (isImuControlFrame(packet)) return null
-        return if (isAirPackedReport(packet)) parseAirPacked(packet) else parseMpu6050(packet)
+    fun parse(packet: ByteArray, length: Int = packet.size): ImuSample? {
+        if (isImuControlFrame(packet, length)) return null
+        return if (isAirPackedReport(packet, length)) parseAirPacked(packet, length) else parseMpu6050(packet)
     }
 
     /**
@@ -80,8 +80,8 @@ object ImuParser {
      * `(raw * mul / div).to_radians()` — not MPU `2000/32768`, which is for
      * int16 ±2000 dps sensors. Air reports i24 plus per-packet mul/div.
      */
-    fun parseAirPacked(packet: ByteArray): ImuSample? {
-        if (packet.size < AirReport.MIN_SIZE || !isAirPackedReport(packet)) return null
+    fun parseAirPacked(packet: ByteArray, length: Int = packet.size): ImuSample? {
+        if (length < AirReport.MIN_SIZE || !isAirPackedReport(packet, length)) return null
         val temperature = packet.readI16Le(AirReport.TEMPERATURE)
         val timestampNs = packet.readI64Le(AirReport.TIMESTAMP_NS)
         val gyroMul = packet.readU16Le(AirReport.GYRO_MUL).toFloat()

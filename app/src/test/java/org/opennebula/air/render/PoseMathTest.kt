@@ -175,4 +175,47 @@ class PoseMathTest {
         val angle = 2f * kotlin.math.atan2(mid[2], mid[0])
         assertEquals(Math.toRadians(45.0).toFloat(), angle, 0.05f)
     }
+
+    @Test
+    fun neck_model_at_neutral_pose_has_zero_translation() {
+        val view = PoseMath.viewFromQuat(1f, 0f, 0f, 0f, neckModel = true)
+        assertEquals(0f, view[12], 1e-6f)
+        assertEquals(0f, view[13], 1e-6f)
+        assertEquals(0f, view[14], 1e-6f)
+    }
+
+    @Test
+    fun neck_model_at_yaw_translates_camera_in_arc() {
+        val s = kotlin.math.sin(Math.toRadians(45.0)).toFloat()
+        val c = kotlin.math.cos(Math.toRadians(45.0)).toFloat()
+        // 90 deg yaw
+        val view = PoseMath.viewFromQuat(c, 0f, s, 0f, neckModel = true)
+        // Camera translation should shift along the arc of the neck offset
+        val arcRadius = kotlin.math.sqrt(StereoConfig.NECK_FORWARD * StereoConfig.NECK_FORWARD)
+        val shift = kotlin.math.sqrt(view[12] * view[12] + view[14] * view[14])
+        assertTrue("Camera should translate along neck arc (got $shift)", shift > 0.05f)
+    }
+
+    @Test
+    fun so3_exponential_map_preserves_exact_norm_and_angle() {
+        val rad = Math.toRadians(120.0).toFloat() // Rapid 120 deg/s rotation
+        var w = 1f
+        var x = 0f
+        var y = 0f
+        var z = 0f
+        val steps = 1000
+        val dt = 1f / steps // 1 second total -> 120 deg total rotation
+        repeat(steps) {
+            val q = PoseMath.integrateQuat(w, x, y, z, 0f, rad, 0f, dt)
+            w = q[0]
+            x = q[1]
+            y = q[2]
+            z = q[3]
+            val norm = kotlin.math.sqrt(w * w + x * x + y * y + z * z)
+            assertEquals(1f, norm, 1e-6f)
+        }
+        val expectedHalf = Math.toRadians(60.0).toFloat()
+        assertEquals(kotlin.math.cos(expectedHalf.toDouble()).toFloat(), w, 0.01f)
+        assertEquals(kotlin.math.sin(expectedHalf.toDouble()).toFloat(), y, 0.01f)
+    }
 }

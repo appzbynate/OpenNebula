@@ -77,12 +77,30 @@ fun SettingsDialog(
                     )
                 }
                 val brightness by viewModel.brightness.collectAsStateWithLifecycle()
-                Text("Brightness $brightness / 7 (MCU later)", fontSize = 13.sp)
+                Text("Brightness $brightness / 7", fontSize = 13.sp)
                 Slider(
                     value = brightness.toFloat(),
                     onValueChange = { viewModel.setBrightness(it.toInt()) },
                     valueRange = 0f..7f,
                     steps = 6,
+                )
+                val refreshHz by viewModel.refreshHz.collectAsStateWithLifecycle()
+                Text(
+                    "Glasses refresh $refreshHz Hz" +
+                        if (stereo && refreshHz == 120) " (3D max 90 — MCU uses 90)" else "",
+                    fontSize = 13.sp,
+                )
+                Slider(
+                    value = refreshHz.toFloat(),
+                    onValueChange = { viewModel.setRefreshHz(it.toInt()) },
+                    valueRange = 60f..120f,
+                    steps = 1,
+                )
+                Text(
+                    "60 / 90 / 120 — default 90 matches Real FPS (no frame-duplication ghosting). " +
+                        "Use 120 only when Logcat Real FPS holds ~120.",
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.secondary,
                 )
                 if (stereo) {
                     Text("IPD ${"%.0f".format(ipd * 1000f)} mm", fontSize = 13.sp)

@@ -11,8 +11,8 @@ class SpatialBrowserTest {
     fun virtual_display_is_private_and_not_mirror() {
         assertEquals(0, SpatialBrowser.VD_FLAGS and DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC)
         assertEquals(0, SpatialBrowser.VD_FLAGS and DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR)
+        assertEquals(0, SpatialBrowser.VD_FLAGS and DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION)
         assertTrue(SpatialBrowser.VD_FLAGS and DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY != 0)
-        assertTrue(SpatialBrowser.VD_FLAGS and DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION != 0)
         assertTrue(SpatialBrowser.VD_FLAGS and SpatialBrowser.FLAG_DESTROY_CONTENT_ON_REMOVAL != 0)
     }
 

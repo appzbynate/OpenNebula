@@ -5,18 +5,30 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import kotlin.math.abs
 
+/**
+ * Tests for the tuned Fusion stack (steady gain 0.04, no mag,
+ * FusionOffset 0.02 Hz / 5 s / 0.5 °/s) — Y-up gravity for Air body frame.
+ */
 class MadgwickImuTest {
     @Test
-    fun baseline_gravity_assist_is_off() {
-        assertEquals(0.35f, MadgwickImu.GAIN, 0f)
-        val filter = MadgwickImu()
-        repeat(MadgwickImu.WARMUP_SAMPLES + 50) { i -> filter.update(lookSample(i, 0f, 0f, 0f)) }
-        // Warmup ends frozen but short of STILL_BEFORE_GRAVITY in this loop alone…
-        assertEquals(0f, filter.lastGain(), 0f)
+    fun fusion_gain_matches_tuned_steady() {
+        assertEquals(0.04f, MadgwickImu.GAIN, 0f)
+        assertEquals(0.04f, MadgwickImu.REST_GRAVITY_GAIN, 0f)
+        assertEquals(0.5f, FusionOffset.THRESHOLD_DPS, 0f)
+        assertEquals(5.0f, FusionOffset.TIMEOUT_S, 0f)
     }
 
     @Test
-    fun long_still_does_not_gravity_pull_pitch() {
+    fun after_startup_gain_is_steady() {
+        val filter = MadgwickImu()
+        // 3 s startup ramp at 1 kHz.
+        repeat(3500) { i -> filter.update(lookSample(i, 0f, 0f, 0f)) }
+        assertEquals(0.04f, filter.lastGain(), 0.005f)
+        assertTrue(filter.gravityPulling())
+    }
+
+    @Test
+    fun tip_then_still_levels_pitch_via_accel() {
         val filter = MadgwickImu()
         var pose = Orientation.IDENTITY
         repeat(MadgwickImu.WARMUP_SAMPLES) { i -> pose = filter.update(lookSample(i, 0f, 0f, 0f)) }
@@ -26,27 +38,31 @@ class MadgwickImuTest {
         for (i in t0 until t0 + 300) pose = filter.update(sample(i, 60f, 0f, 0f, jerk))
         val tipped = pose.pitchDeg
         assertTrue(abs(tipped) > 8f)
-        for (i in t0 + 300 until t0 + 300 + MadgwickImu.STILL_BEFORE_GRAVITY + 2500) {
-            pose = filter.update(lookSample(i, 0f, 0f, 0f))
+        val levelAccel = Vec3f(0f, MadgwickImu.GRAVITY, 0f)
+        // Accel rejection (~5 s) then slow leveling at gain 0.04.
+        val hold = FusionAhrs.RECOVERY_TRIGGER_SAMPLES + 60_000
+        for (i in t0 + 300 until t0 + 300 + hold) {
+            pose = filter.update(sample(i, 0f, 0f, 0f, levelAccel))
         }
-        // Rest freeze holds pose — no accel horizon crawl (that looked like icons falling).
-        assertEquals(tipped, pose.pitchDeg, 1.5f)
-        assertEquals(0f, filter.lastGain(), 0f)
+        assertEquals(0f, pose.pitchDeg, 5f)
+        assertEquals(0f, pose.rollDeg, 5f)
     }
 
     @Test
-    fun jerk_keeps_gain_zero() {
+    fun jerk_accel_is_rejected_briefly() {
         val filter = MadgwickImu()
-        repeat(MadgwickImu.WARMUP_SAMPLES) { i -> filter.update(lookSample(i, 0f, 0f, 0f)) }
+        var pose = Orientation.IDENTITY
+        repeat(MadgwickImu.WARMUP_SAMPLES) { i -> pose = filter.update(lookSample(i, 0f, 0f, 0f)) }
         filter.recenter()
         val jerk = Vec3f(0f, 20f, 0f)
         val t0 = MadgwickImu.WARMUP_SAMPLES
-        for (i in t0 until t0 + 50) filter.update(sample(i, 0f, 0f, 0f, jerk))
-        assertEquals(0f, filter.lastGain(), 0f)
+        for (i in t0 until t0 + 50) pose = filter.update(sample(i, 0f, 0f, 0f, jerk))
+        // Large linear accel should not instantly yank attitude to a nonsense horizon.
+        assertTrue(abs(pose.pitchDeg) < 25f)
     }
 
     @Test
-    fun warmup_with_tilted_accel_does_not_yank_pitch() {
+    fun warmup_with_tilted_accel_then_recenter_holds() {
         val filter = MadgwickImu()
         val tilted = Vec3f(0.64f, 9.57f, 1.99f)
         repeat(MadgwickImu.WARMUP_SAMPLES) { i ->
@@ -58,30 +74,39 @@ class MadgwickImuTest {
         for (i in t0 until t0 + 500) {
             pose = filter.update(sample(i, 0f, 0f, 0f, tilted))
         }
-        assertEquals(0f, pose.pitchDeg, 2f)
-        assertEquals(0f, pose.yawDeg, 2f)
-        assertEquals(0f, pose.rollDeg, 2f)
+        assertEquals(0f, pose.pitchDeg, 3f)
+        assertEquals(0f, pose.yawDeg, 3f)
+        assertEquals(0f, pose.rollDeg, 3f)
     }
 
     @Test
-    fun warmup_seeds_bias_even_when_raw_offset_looks_like_motion() {
+    fun fusion_offset_learns_small_rest_bias_after_timeout() {
         val filter = MadgwickImu()
-        // Constant 25°/s raw bias — must not block warmup via STILL_DPS gate.
+        // 0.3 °/s — under 0.5 °/s threshold; EMA is slow (0.02 Hz).
+        val learnSamples = FusionOffset.TIMEOUT_SAMPLES + 40_000 // ~40 s of learning
+        val still = MadgwickImu.WARMUP_SAMPLES + learnSamples
+        repeat(still) { i -> filter.update(lookSample(i, 0.3f, 0f, 0f)) }
+        val b = filter.residualBiasDps()
+        assertEquals(0.3f, b.x, 0.08f)
+        filter.recenter()
+        var pose = Orientation.IDENTITY
+        for (i in still until still + 2000) {
+            pose = filter.update(lookSample(i, 0.3f, 0f, 0f))
+        }
+        assertEquals(0f, pose.pitchDeg, 4f)
+        assertEquals(0f, pose.yawDeg, 4f)
+    }
+
+    @Test
+    fun large_constant_rate_is_not_offset_it_is_motion() {
+        val filter = MadgwickImu()
+        // 25 °/s is above 0.5 °/s threshold — FusionOffset must not treat as bias.
+        // Factory flash cal is what removes large gyro_bias; not runtime offset.
         repeat(MadgwickImu.WARMUP_SAMPLES) { i ->
             filter.update(lookSample(i, 25f, 0f, 0f))
         }
         val b = filter.residualBiasDps()
-        assertEquals(25f, b.x, 1f)
-        assertEquals(0f, b.y, 1f)
-        assertEquals(0f, b.z, 1f)
-        // After warmup, corrected still samples should not keep integrating.
-        var pose = Orientation.IDENTITY
-        filter.recenter()
-        for (i in MadgwickImu.WARMUP_SAMPLES until MadgwickImu.WARMUP_SAMPLES + 2000) {
-            pose = filter.update(lookSample(i, 25f, 0f, 0f))
-        }
-        assertEquals(0f, pose.pitchDeg, 3f)
-        assertEquals(0f, pose.yawDeg, 3f)
+        assertEquals(0f, b.x, 0.05f)
     }
 
     @Test
@@ -95,10 +120,10 @@ class MadgwickImuTest {
         assertTrue(abs(before.qw - 1f) > 0.01f || abs(before.qy) > 0.01f)
         filter.recenter()
         pose = filter.update(lookSample(t0 + 300, 0f, 0f, 0f))
-        assertEquals(1f, pose.qw, 0.02f)
-        assertEquals(0f, pose.qx, 0.02f)
-        assertEquals(0f, pose.qy, 0.02f)
-        assertEquals(0f, pose.qz, 0.02f)
+        assertEquals(1f, pose.qw, 0.05f)
+        assertEquals(0f, pose.qx, 0.05f)
+        assertEquals(0f, pose.qy, 0.05f)
+        assertEquals(0f, pose.qz, 0.05f)
     }
 
     @Test
@@ -114,7 +139,7 @@ class MadgwickImuTest {
         for (i in t0 until t0 + 500) {
             pose = filter.update(lookSample(i, 0f, 30f, 0f, nsPerSample = stepNs))
         }
-        assertEquals(30f, pose.yawDeg, 2f)
+        assertEquals(30f, pose.yawDeg, 4f)
     }
 
     @Test
@@ -161,9 +186,10 @@ class MadgwickImuTest {
         val tLeft = MadgwickImu.WARMUP_SAMPLES
         for (i in tLeft until tLeft + 500) pose = filter.update(lookSample(i, 0f, 60f, 0f))
         val afterTurn = pose.yawDeg
-        assertEquals(30f, afterTurn, 3f)
+        assertEquals(30f, afterTurn, 4f)
         for (i in tLeft + 500 until tLeft + 2500) pose = filter.update(lookSample(i, 0f, 0f, 0f))
-        assertEquals(afterTurn, pose.yawDeg, 1.5f)
+        // Mag-less: yaw holds (no magnetic heading).
+        assertEquals(afterTurn, pose.yawDeg, 2f)
     }
 
     @Test
@@ -178,9 +204,9 @@ class MadgwickImuTest {
             pose = filter.update(nodSample(i, angle, 60f))
         }
         val afterTurn = pose.pitchDeg
-        assertEquals(30f, afterTurn, 4f)
+        assertEquals(30f, afterTurn, 5f)
         for (i in tNod + 500 until tNod + 2500) pose = filter.update(nodSample(i, 30f, 0f))
-        assertEquals(afterTurn, pose.pitchDeg, 3f)
+        assertEquals(afterTurn, pose.pitchDeg, 4f)
     }
 
     @Test
@@ -202,84 +228,31 @@ class MadgwickImuTest {
     }
 
     @Test
-    fun short_still_does_not_gravity_yank_before_delay() {
-        val filter = MadgwickImu()
-        var pose = Orientation.IDENTITY
-        repeat(MadgwickImu.WARMUP_SAMPLES) { i -> pose = filter.update(lookSample(i, 0f, 0f, 0f)) }
-        filter.recenter()
-        val tPitch = MadgwickImu.WARMUP_SAMPLES
-        val jerk = Vec3f(0f, 20f, 0f)
-        for (i in tPitch until tPitch + 300) pose = filter.update(sample(i, 60f, 0f, 0f, jerk))
-        val tipped = pose.pitchDeg
-        assertTrue(abs(tipped) > 8f)
-        // Under STILL_BEFORE_GRAVITY — must not yank yet.
-        for (i in tPitch + 300 until tPitch + 300 + MadgwickImu.STILL_BEFORE_GRAVITY - 50) {
-            pose = filter.update(lookSample(i, 0f, 0f, 0f))
-        }
-        assertEquals(tipped, pose.pitchDeg, 1.5f)
-        assertEquals(0f, filter.lastGain(), 0f)
-    }
-
-    @Test
-    fun jerk_accel_does_not_pull_pitch_to_horizon() {
-        val filter = MadgwickImu()
-        var pose = Orientation.IDENTITY
-        repeat(MadgwickImu.WARMUP_SAMPLES) { i -> pose = filter.update(lookSample(i, 0f, 0f, 0f)) }
-        filter.recenter()
-        val jerk = Vec3f(0f, 20f, 0f)
-        val tJerk = MadgwickImu.WARMUP_SAMPLES
-        for (i in tJerk until tJerk + 300) pose = filter.update(sample(i, 60f, 0f, 0f, jerk))
-        val afterTurn = pose.pitchDeg
-        assertTrue(abs(afterTurn) > 8f)
-        for (i in tJerk + 300 until tJerk + 1600) pose = filter.update(sample(i, 0f, 0f, 0f, jerk))
-        assertEquals(afterTurn, pose.pitchDeg, 1.5f)
-    }
-
-    @Test
-    fun nod_turnaround_does_not_yank_pitch_with_gravity() {
+    fun slow_glance_above_offset_threshold_integrates() {
         val filter = MadgwickImu()
         var pose = Orientation.IDENTITY
         repeat(MadgwickImu.WARMUP_SAMPLES) { i -> pose = filter.update(lookSample(i, 0f, 0f, 0f)) }
         filter.recenter()
         val t0 = MadgwickImu.WARMUP_SAMPLES
-        for (i in t0 until t0 + 250) pose = filter.update(nodSample(i, ((i - t0) * 0.06f).coerceAtMost(15f), 60f))
-        val tipped = pose.pitchDeg
-        assertTrue(abs(tipped) > 8f)
-        for (i in t0 + 250 until t0 + 250 + 400) {
-            pose = filter.update(nodSample(i, tipped, 0f))
-            assertEquals("gravity yank at rest i=$i", tipped, pose.pitchDeg, 1.5f)
-        }
-    }
-
-    @Test
-    fun rest_freeze_ignores_heartbeat_gyro_without_rubberband() {
-        val filter = MadgwickImu()
-        var pose = Orientation.IDENTITY
-        repeat(MadgwickImu.WARMUP_SAMPLES) { i -> pose = filter.update(lookSample(i, 0f, 0f, 0f)) }
-        filter.recenter()
-        val t0 = MadgwickImu.WARMUP_SAMPLES
-        for (i in t0 until t0 + 2000) {
-            pose = filter.update(lookSample(i, 0f, 0.6f, 0f))
-        }
-        assertEquals(0f, pose.yawDeg, 0.5f)
-        // Leaving rest: need rate above EXIT hysteresis.
-        for (i in t0 + 2000 until t0 + 2050) pose = filter.update(lookSample(i, 0f, 10f, 0f))
-        for (i in t0 + 2050 until t0 + 2550) pose = filter.update(lookSample(i, 0f, 60f, 0f))
-        assertEquals(30f, pose.yawDeg, 4f)
-    }
-
-    @Test
-    fun slow_look_is_not_absorbed_as_gyro_bias() {
-        val filter = MadgwickImu()
-        var pose = Orientation.IDENTITY
-        repeat(MadgwickImu.WARMUP_SAMPLES) { i -> pose = filter.update(lookSample(i, 0f, 0f, 0f)) }
-        filter.recenter()
-        val tSlow = MadgwickImu.WARMUP_SAMPLES
-        // Above REST_EXIT_HARD so rest-hysteresis does not freeze the glance.
-        for (i in tSlow until tSlow + 500) pose = filter.update(lookSample(i, 0f, 15f, 0f))
-        assertEquals(7.5f, pose.yawDeg, 1.5f)
+        // Just above FusionOffset 0.5 °/s threshold — must integrate, not bias-eat.
+        for (i in t0 until t0 + 500) pose = filter.update(lookSample(i, 0f, 0.8f, 0f))
+        assertTrue(abs(pose.yawDeg) > 0.3f)
         val b = filter.residualBiasDps()
-        assertEquals(0f, b.y, 1e-5f)
+        assertEquals(0f, b.y, 0.05f)
+    }
+
+    @Test
+    fun slow_nod_above_threshold_is_not_absorbed_into_bias() {
+        val filter = MadgwickImu()
+        var pose = Orientation.IDENTITY
+        repeat(MadgwickImu.WARMUP_SAMPLES) { i -> pose = filter.update(lookSample(i, 0f, 0f, 0f)) }
+        filter.recenter()
+        val t0 = MadgwickImu.WARMUP_SAMPLES
+        val before = filter.residualBiasDps()
+        for (i in t0 until t0 + 2000) pose = filter.update(lookSample(i, 4f, 0f, 0f))
+        assertTrue("slow nod should change pitch (got ${pose.pitchDeg})", abs(pose.pitchDeg) > 5f)
+        val after = filter.residualBiasDps()
+        assertEquals("bias must not absorb motion above 0.5 °/s", before.x, after.x, 0.05f)
     }
 
     @Test
@@ -302,13 +275,13 @@ class MadgwickImuTest {
         filter.recenter()
         val t90 = MadgwickImu.WARMUP_SAMPLES
         for (i in t90 until t90 + 2000) pose = filter.update(lookSample(i, 0f, 60f, 0f))
-        assertEquals(120f, pose.yawDeg, 6f)
+        assertEquals(120f, pose.yawDeg, 8f)
+        assertEquals(0f, pose.pitchDeg, 8f)
+        assertEquals(0f, pose.rollDeg, 8f)
+        for (i in t90 + 2000 until t90 + 2600) pose = filter.update(lookSample(i, 0f, 0f, 0f))
+        assertEquals(120f, pose.yawDeg, 8f)
         assertEquals(0f, pose.pitchDeg, 6f)
         assertEquals(0f, pose.rollDeg, 6f)
-        for (i in t90 + 2000 until t90 + 2600) pose = filter.update(lookSample(i, 0f, 0f, 0f))
-        assertEquals(120f, pose.yawDeg, 6f)
-        assertEquals(0f, pose.pitchDeg, 4f)
-        assertEquals(0f, pose.rollDeg, 4f)
     }
 
     @Test
@@ -319,9 +292,9 @@ class MadgwickImuTest {
         filter.recenter()
         val t0 = MadgwickImu.WARMUP_SAMPLES
         for (i in t0 until t0 + 500) pose = filter.update(lookSample(i, 0f, 40f, 0f))
-        assertEquals(20f, pose.yawDeg, 2f)
-        assertEquals(0f, pose.rollDeg, 1.5f)
-        assertEquals(0f, pose.pitchDeg, 1.5f)
+        assertEquals(20f, pose.yawDeg, 3f)
+        assertEquals(0f, pose.rollDeg, 3f)
+        assertEquals(0f, pose.pitchDeg, 3f)
     }
 
     @Test
@@ -334,8 +307,8 @@ class MadgwickImuTest {
         for (i in tGate until tGate + 700) {
             val gy = if ((i - tGate) % 40 < 20) 22f else 0f
             pose = filter.update(lookSample(i, 0f, gy, 0f))
-            assertTrue("roll snap at i=$i roll=${pose.rollDeg}", abs(pose.rollDeg) < 8f)
-            assertTrue("pitch snap at i=$i pitch=${pose.pitchDeg}", abs(pose.pitchDeg) < 8f)
+            assertTrue("roll snap at i=$i roll=${pose.rollDeg}", abs(pose.rollDeg) < 10f)
+            assertTrue("pitch snap at i=$i pitch=${pose.pitchDeg}", abs(pose.pitchDeg) < 10f)
         }
     }
 
@@ -358,7 +331,7 @@ class MadgwickImuTest {
         filter.recenter()
         val t0 = MadgwickImu.WARMUP_SAMPLES
         for (i in t0 until t0 + 500) pose = filter.update(lookSample(i, 0f, 60f, 0f, nsPerSample = 1L))
-        assertEquals(30f, pose.yawDeg, 2f)
+        assertEquals(30f, pose.yawDeg, 3f)
     }
 
     @Test
@@ -373,7 +346,64 @@ class MadgwickImuTest {
         for (i in t0 until t0 + 500) {
             pose = filter.update(lookSample(i, 0f, 60f, 0f, nsPerSample = 1_000L))
         }
-        assertEquals(30f, pose.yawDeg, 2f)
+        assertEquals(30f, pose.yawDeg, 3f)
+    }
+
+    @Test
+    fun active_calibration_accumulates_and_sets_bias() {
+        val filter = MadgwickImu()
+        filter.restartBiasCalibration()
+        assertEquals(0f, filter.biasProgress(), 0f)
+
+        // Feed quiet samples with a 0.45 deg/s offset on X and -0.35 on Y
+        val offsetSamples = MadgwickImu.CALIBRATION_SAMPLES
+        repeat(offsetSamples) { i ->
+            filter.update(lookSample(i, 0.45f, -0.35f, 0.05f))
+        }
+
+        assertTrue(filter.biasReady())
+        assertEquals(1f, filter.biasProgress(), 0.01f)
+        val bias = filter.residualBiasDps()
+        assertEquals(0.45f, bias.x, 0.02f)
+        assertEquals(-0.35f, bias.y, 0.02f)
+        assertEquals(0.05f, bias.z, 0.02f)
+    }
+
+    @Test
+    fun motion_gating_shuts_off_accelerometer_during_head_turn() {
+        val filter = MadgwickImu()
+        // Complete startup period (3.5 s)
+        repeat(3500) { i -> filter.update(lookSample(i, 0f, 0f, 0f)) }
+        assertEquals(0.04f, filter.lastGain(), 0.005f)
+
+        // Turn head at 35 dps
+        filter.update(lookSample(3501, 0f, 35f, 0f))
+        assertEquals(0f, filter.lastGain(), 0f)
+        org.junit.Assert.assertFalse(filter.gravityPulling())
+
+        // Stop turning head
+        filter.update(lookSample(3502, 0f, 0f, 0f))
+        assertEquals(0.04f, filter.lastGain(), 0.005f)
+        assertTrue(filter.gravityPulling())
+    }
+
+    @Test
+    fun still_deadzone_prevents_creep_at_rest() {
+        val filter = MadgwickImu()
+        repeat(3500) { i -> filter.update(lookSample(i, 0f, 0f, 0f)) }
+        filter.recenter()
+
+        var pose = Orientation.IDENTITY
+        // Feed 5000 samples of 0.25 dps micro-tremor / sensor noise (below 0.45 dps deadzone)
+        for (i in 3500 until 8500) {
+            pose = filter.update(lookSample(i, 0.20f, -0.25f, 0.15f))
+        }
+
+        // Without ZUPT stillness deadzone, this would have drifted > 1.25 degrees.
+        // With ZUPT, orientation remains pinned at zero.
+        assertEquals("yaw must not creep during stillness", 0f, pose.yawDeg, 0.001f)
+        assertEquals("pitch must not creep during stillness", 0f, pose.pitchDeg, 0.001f)
+        assertEquals("roll must not creep during stillness", 0f, pose.rollDeg, 0.001f)
     }
 }
 

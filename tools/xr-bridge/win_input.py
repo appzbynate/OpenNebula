@@ -7,7 +7,16 @@ from ctypes import wintypes
 
 from desktop_capture import monitor_origin_size
 
-user32 = ctypes.windll.user32
+user32 = ctypes.WinDLL("user32", use_last_error=True)
+
+# 64-bit Windows: without argtypes, GetCursorPos/SetCursorPos silently fail
+# (often read as 0,0 and never move) — trackpad looked "dead" with a flickering overlay.
+user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+user32.GetCursorPos.restype = wintypes.BOOL
+user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+user32.SetCursorPos.restype = wintypes.BOOL
+user32.SendInput.argtypes = [wintypes.UINT, ctypes.c_void_p, ctypes.c_int]
+user32.SendInput.restype = wintypes.UINT
 
 MOUSEEVENTF_MOVE = 0x0001
 MOUSEEVENTF_LEFTDOWN = 0x0002
@@ -17,11 +26,26 @@ MOUSEEVENTF_RIGHTUP = 0x0010
 MOUSEEVENTF_MIDDLEDOWN = 0x0020
 MOUSEEVENTF_MIDDLEUP = 0x0040
 MOUSEEVENTF_WHEEL = 0x0800
+MOUSEEVENTF_HWHEEL = 0x01000
+MOUSEEVENTF_ABSOLUTE = 0x8000
+MOUSEEVENTF_VIRTUALDESK = 0x4000
 WHEEL_DELTA = 120
 
 INPUT_MOUSE = 0
 INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP = 0x0002
+
+VK_CONTROL = 0x11
+VK_MENU = 0x12  # Alt
+VK_SHIFT = 0x10
+VK_LWIN = 0x5B
+VK_TAB = 0x09
+VK_LEFT = 0x25
+VK_RIGHT = 0x27
+VK_UP = 0x26
+VK_DOWN = 0x28
+VK_D = 0x44
+VK_S = 0x53
 
 
 class MOUSEINPUT(ctypes.Structure):
@@ -75,14 +99,17 @@ def uv_to_screen(u: float, v: float) -> tuple[int, int]:
 
 def move_to_uv(u: float, v: float) -> None:
     x, y = uv_to_screen(u, v)
-    user32.SetCursorPos(x, y)
+    if not user32.SetCursorPos(int(x), int(y)):
+        raise ctypes.WinError(ctypes.get_last_error())
 
 
 def _mouse_flags(flags: int, data: int = 0) -> None:
     inp = INPUT()
     inp.type = INPUT_MOUSE
     inp.union.mi = MOUSEINPUT(0, 0, data, flags, 0, None)
-    user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+    n = user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+    if n != 1:
+        raise ctypes.WinError(ctypes.get_last_error())
 
 
 def apply_buttons(mask: int) -> None:
@@ -99,20 +126,77 @@ def apply_buttons(mask: int) -> None:
     _buttons = mask
 
 
+def ensure_on_primary() -> tuple[int, int]:
+    """If the cursor is off the captured primary monitor, warp it to the center."""
+    left, top, width, height = monitor_origin_size()
+    pt = wintypes.POINT()
+    if not user32.GetCursorPos(ctypes.byref(pt)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    x, y = int(pt.x), int(pt.y)
+    right = left + max(width, 1)
+    bottom = top + max(height, 1)
+    if x < left or x >= right or y < top or y >= bottom:
+        x = left + width // 2
+        y = top + height // 2
+        if not user32.SetCursorPos(x, y):
+            raise ctypes.WinError(ctypes.get_last_error())
+    return x, y
+
+
 def move_rel(dx: int, dy: int) -> None:
-    """Relative mouse move (laptop trackpad style)."""
+    """Pixel-accurate relative move on the primary (captured) monitor."""
     if dx == 0 and dy == 0:
         return
-    inp = INPUT()
-    inp.type = INPUT_MOUSE
-    inp.union.mi = MOUSEINPUT(int(dx), int(dy), 0, MOUSEEVENTF_MOVE, 0, None)
-    user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+    left, top, width, height = monitor_origin_size()
+    x, y = ensure_on_primary()
+    nx = max(left, min(left + max(width, 1) - 1, x + int(dx)))
+    ny = max(top, min(top + max(height, 1) - 1, y + int(dy)))
+    if not user32.SetCursorPos(nx, ny):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def center_on_primary() -> None:
+    """Place cursor at primary center (call when Remote Desktop session starts)."""
+    left, top, width, height = monitor_origin_size()
+    x = left + max(width, 1) // 2
+    y = top + max(height, 1) // 2
+    if not user32.SetCursorPos(int(x), int(y)):
+        raise ctypes.WinError(ctypes.get_last_error())
 
 
 def wheel(delta: int) -> None:
     if not delta:
         return
     _mouse_flags(MOUSEEVENTF_WHEEL, int(delta) * WHEEL_DELTA)
+
+
+def hwheel(delta: int) -> None:
+    """Horizontal wheel (two-finger sideways scroll)."""
+    if not delta:
+        return
+    _mouse_flags(MOUSEEVENTF_HWHEEL, int(delta) * WHEEL_DELTA)
+
+
+def zoom(ticks: int) -> None:
+    """Ctrl + wheel — browser/map zoom like a precision trackpad pinch."""
+    if not ticks:
+        return
+    key(VK_CONTROL, True)
+    try:
+        wheel(int(ticks))
+    finally:
+        key(VK_CONTROL, False)
+
+
+def chord(*vks: int) -> None:
+    """Press all keys then release in reverse (Win+Tab, Alt+Tab, …)."""
+    ordered = [int(v) & 0xFF for v in vks if int(v) != 0]
+    if not ordered:
+        return
+    for vk in ordered:
+        key(vk, True)
+    for vk in reversed(ordered):
+        key(vk, False)
 
 
 def pointer(u: float, v: float, buttons: int = 0, wheel_ticks: int = 0) -> None:
@@ -133,7 +217,9 @@ def key(vk: int, down: bool) -> None:
     inp = INPUT()
     inp.type = INPUT_KEYBOARD
     inp.union.ki = KEYBDINPUT(int(vk) & 0xFF, 0, 0 if down else KEYEVENTF_KEYUP, 0, None)
-    user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+    n = user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+    if n != 1:
+        raise ctypes.WinError(ctypes.get_last_error())
 
 
 def release_all() -> None:

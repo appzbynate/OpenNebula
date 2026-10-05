@@ -32,12 +32,11 @@ object SpatialBrowser {
             "Chrome/151.0.0.0 Safari/537.36"
 
     /**
-     * Private presentation display for in-app WebView.
-     * Never PUBLIC (glasses hijack) and never AUTO_MIRROR.
+     * Private VirtualDisplay for in-app WebView.
+     * OWN_CONTENT_ONLY only — never PUBLIC / AUTO_MIRROR (those hijack glasses or duplicate).
      */
     val VD_FLAGS: Int =
         DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY or
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION or
             FLAG_DESTROY_CONTENT_ON_REMOVAL
 
     val webView = AtomicReference<WebView?>(null)

@@ -7,6 +7,7 @@ import android.graphics.Typeface
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -79,18 +80,17 @@ class RemoteDesktopSession(
         } else {
             (prev.height / SpatialLayout.PANEL_H).coerceIn(SpatialWindow.SCALE_MIN, SpatialWindow.SCALE_MAX)
         }
-        pipeline.pose.set(
-            SpatialWindow.fromControls(
-                prev.distance,
-                prev.y,
-                scale,
-                prev.x,
-                aspect,
-                prev.yaw,
-                prev.pitch,
-                prev.roll,
-            ),
-        )
+        val width: Float
+        val heightM: Float
+        if (aspect >= 1f) {
+            width = SpatialLayout.PANEL_W * scale
+            heightM = width / aspect.coerceIn(0.30f, 4.0f)
+        } else {
+            heightM = SpatialLayout.PANEL_H * scale
+            width = heightM * aspect.coerceIn(0.30f, 4.0f)
+        }
+        // Size only — never rewrite x/y/z/yaw/pitch (that fought the pose lock / head).
+        pipeline.pose.set(prev.copy(width = width, height = heightM))
         onLog("desktop panel ${w}x$h aspect=${"%.3f".format(aspect)}")
     }
 
@@ -154,7 +154,7 @@ class RemoteDesktopSession(
                     -SpatialLayout.PANEL_Z,
                     SpatialLayout.PANEL_Y,
                     1.25f,
-                    -1.60f,
+                    0f,
                     16f / 9f,
                 ),
             )
@@ -164,14 +164,34 @@ class RemoteDesktopSession(
             pipeline.setActive(true)
             input.connect(host.address, host.controlPort)
             video.start(host.address, XrBridgeProtocol.DESKTOP_VIDEO_PORT)
+            val inputUp = withContext(Dispatchers.IO) {
+                repeat(40) {
+                    if (input.isConnected()) return@withContext true
+                    delay(50)
+                }
+                input.isConnected()
+            }
+            if (inputUp) {
+                // Visible proof the control path works (cursor wiggles once).
+                input.moveRel(48, 0, buttons = -1)
+                delay(80)
+                input.moveRel(-48, 0, buttons = -1)
+                onLog("mouse pulse OK — swipe trackpad to move PC cursor")
+            } else {
+                onLog("control socket DOWN — bridge :${host.controlPort} not accepting input")
+            }
             _ui.value = _ui.value.copy(
                 connected = true,
                 busy = false,
                 selected = host,
                 open = false,
-                status = "Connected — aim + tap to click",
+                status = if (inputUp) {
+                    "Connected — trackpad moves the PC mouse"
+                } else {
+                    "Video up but control socket failed — restart bridge"
+                },
             )
-            onLog("Remote Desktop connected ${host.address}")
+            onLog("Remote Desktop connected ${host.address} input=${if (inputUp) "up" else "DOWN"}")
         }
     }
 
@@ -199,6 +219,10 @@ class RemoteDesktopSession(
         pipeline.closeCapture()
     }
 
+    fun setRefreshHz(hz: Int) {
+        input.setRefreshHz(hz)
+    }
+
     fun isConnected(): Boolean = _ui.value.connected
 
     fun movePointer(u: Float, v: Float) {
@@ -206,20 +230,38 @@ class RemoteDesktopSession(
         input.pointer(u.coerceIn(0f, 1f), v.coerceIn(0f, 1f), buttons, 0)
     }
 
-    /** Laptop-style trackpad: relative mouse deltas in screen pixels. */
+    /** Laptop-style trackpad: relative mouse deltas in screen pixels (no button sync). */
     fun moveRel(dx: Int, dy: Int) {
-        if (!_ui.value.connected) return
+        if (!_ui.value.connected) {
+            onLog("trackpad ignored — remote desktop not connected")
+            return
+        }
         if (dx == 0 && dy == 0) return
-        input.moveRel(dx, dy, buttons)
+        if (!input.isConnected()) {
+            onLog("trackpad: control socket down — reconnect Remote Desktop / start_bridge.bat")
+            return
+        }
+        input.moveRel(dx, dy, buttons = -1)
     }
 
     fun wheel(delta: Int) {
         if (!_ui.value.connected || delta == 0) return
-        // Absolute PTR at current cursor with wheel — uses GetCursorPos implicitly via move_to_uv skip
-        // Prefer REL+wheel: send PTR with wheel only by reading isn't available; use click path.
-        // Encode wheel via PTR at 0.5,0.5 would jump cursor — bad.
-        // Use: REL 0 0 with separate WHEEL command — add WHEEL line.
         input.sendWheel(delta)
+    }
+
+    fun hWheel(delta: Int) {
+        if (!_ui.value.connected || delta == 0) return
+        input.sendHWheel(delta)
+    }
+
+    fun zoom(ticks: Int) {
+        if (!_ui.value.connected || ticks == 0) return
+        input.sendZoom(ticks)
+    }
+
+    fun chord(vararg vk: Int) {
+        if (!_ui.value.connected || vk.isEmpty()) return
+        input.sendChord(*vk)
     }
 
     fun pointerDown(u: Float, v: Float, button: Int = 0) {

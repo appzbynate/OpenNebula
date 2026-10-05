@@ -38,12 +38,47 @@ object NrealAirProtocol {
     const val DISPLAY_MODE_2D = 1
     /** 3840×1080 native SBS — PC/EDID switch; often wrong for phone DP. */
     const val DISPLAY_MODE_3D_SBS_ULTRAWIDE = 3
+    /** 1920×1080 mirror @ 72 Hz (ar-drivers). */
+    const val DISPLAY_MODE_2D_72 = 5
     /**
      * 1920×1080 SBS (ar-drivers HalfSBS / linux `1920x1080_60_SBS`).
      * Same panel timing as 2D; glasses split left/right halves to each eye.
      * Correct match for OpenNebula software SBS on phone DisplayPort.
      */
     const val DISPLAY_MODE_3D_SBS = 8
+    /** 3840×1080 SBS @ 90 Hz — highest SBS refresh (no 120 Hz SBS on Air). */
+    const val DISPLAY_MODE_3D_SBS_90 = 9
+    /** 1920×1080 mirror @ 90 Hz. */
+    const val DISPLAY_MODE_2D_90 = 10
+    /** 1920×1080 mirror @ 120 Hz. */
+    const val DISPLAY_MODE_2D_120 = 11
+
+    /** Snap UI Hz to a supported Air rate. */
+    fun snapRefreshHz(hz: Int): Int = when {
+        hz >= 105 -> 120
+        hz >= 75 -> 90
+        else -> 60
+    }
+
+    /**
+     * MCU display-mode byte for target refresh.
+     * 120 Hz is mirror-only; SBS tops out at mode 9 (90 Hz).
+     */
+    fun displayModeForRefresh(hz: Int, stereo3d: Boolean): Int {
+        val rate = snapRefreshHz(hz)
+        return if (stereo3d) {
+            when (rate) {
+                90, 120 -> DISPLAY_MODE_3D_SBS_90
+                else -> DISPLAY_MODE_3D_SBS
+            }
+        } else {
+            when (rate) {
+                120 -> DISPLAY_MODE_2D_120
+                90 -> DISPLAY_MODE_2D_90
+                else -> DISPLAY_MODE_2D
+            }
+        }
+    }
 
     /**
      * 64-byte IMU HID control frame that enables the sensor stream.

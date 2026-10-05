@@ -9,7 +9,7 @@ import org.junit.Test
 class LauncherPinsTest {
     @Test
     fun default_is_the_original_home_set() {
-        assertEquals(12, LauncherPins.DEFAULT.size)
+        assertEquals(14, LauncherPins.DEFAULT.size)
         assertEquals(ShellApps.SCREEN, LauncherPins.DEFAULT[0])
         assertEquals(ShellApps.EXTENDED, LauncherPins.DEFAULT[1])
         assertTrue(LauncherPins.DEFAULT.contains("web:parsec"))

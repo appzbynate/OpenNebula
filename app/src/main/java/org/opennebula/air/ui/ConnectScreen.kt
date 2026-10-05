@@ -70,6 +70,7 @@ fun ConnectScreen(viewModel: GlassesViewModel) {
     val worldLocked by viewModel.worldLocked.collectAsStateWithLifecycle()
     val stereo by viewModel.stereo.collectAsStateWithLifecycle()
     val brightness by viewModel.brightness.collectAsStateWithLifecycle()
+    val refreshHz by viewModel.refreshHz.collectAsStateWithLifecycle()
     val moveScreen by viewModel.moveScreen.collectAsStateWithLifecycle()
     val focused by viewModel.focused.collectAsStateWithLifecycle()
     val inputMode by viewModel.inputMode.collectAsStateWithLifecycle()
@@ -92,6 +93,7 @@ fun ConnectScreen(viewModel: GlassesViewModel) {
             worldLocked = worldLocked,
             stereo = stereo,
             brightness = brightness,
+            refreshHz = refreshHz,
             mirroring = mirroring,
             moveScreen = moveScreen,
             focused = focused,
@@ -108,6 +110,7 @@ fun ConnectScreen(viewModel: GlassesViewModel) {
             onCalibrate = { viewModel.startCalibration(fromAuto = false) },
             onStereo = viewModel::setStereo,
             onBrightness = viewModel::setBrightness,
+            onRefreshHz = viewModel::setRefreshHz,
             onMirroring = viewModel::setMirroring,
             onFocus = viewModel::focus,
             onClear = viewModel::clearLogs,
@@ -123,9 +126,13 @@ fun ConnectScreen(viewModel: GlassesViewModel) {
             onScroll = viewModel::padScroll,
             onPinch = viewModel::padPinch,
             onThreeSwipe = viewModel::padThreeSwipe,
+            onThreeSwipeVert = viewModel::padThreeSwipeVert,
+            onTwoFingerTap = viewModel::padTwoFingerTap,
+            onThreeTap = viewModel::padThreeTap,
             onInputMode = viewModel::setInputMode,
             onSettings = { showSettings = true },
             onApps = { showApps = true },
+            onPulseMouse = viewModel::pulseDesktopMouse,
             imeVisible = imeVisible && inputMode == InputMode.CONTROLS,
             imeText = imeText,
             onImeText = viewModel::setImeText,
@@ -208,6 +215,9 @@ fun ConnectScreen(viewModel: GlassesViewModel) {
                 onScroll = viewModel::padScroll,
                 onPinch = viewModel::padPinch,
                 onThreeSwipe = viewModel::padThreeSwipe,
+                onThreeSwipeVert = viewModel::padThreeSwipeVert,
+                onTwoFingerTap = viewModel::padTwoFingerTap,
+                onThreeTap = viewModel::padThreeTap,
                 onImeText = viewModel::setImeText,
                 onToggleIme = viewModel::toggleIme,
                 onHideIme = viewModel::hideIme,
@@ -225,6 +235,7 @@ fun ConnectScreenContent(
     worldLocked: Boolean,
     stereo: Boolean,
     brightness: Int,
+    refreshHz: Int,
     mirroring: Boolean,
     moveScreen: Boolean,
     focused: String,
@@ -241,6 +252,7 @@ fun ConnectScreenContent(
     onCalibrate: () -> Unit,
     onStereo: (Boolean) -> Unit,
     onBrightness: (Int) -> Unit,
+    onRefreshHz: (Int) -> Unit,
     onMirroring: (Boolean) -> Unit,
     onFocus: (String) -> Unit,
     onClear: () -> Unit,
@@ -256,9 +268,13 @@ fun ConnectScreenContent(
     onScroll: (Float, Float) -> Unit,
     onPinch: (Float) -> Unit,
     onThreeSwipe: (Float) -> Unit,
+    onThreeSwipeVert: (Float) -> Unit = {},
+    onTwoFingerTap: () -> Unit = {},
+    onThreeTap: () -> Unit = {},
     onInputMode: (InputMode) -> Unit,
     onSettings: () -> Unit,
     onApps: () -> Unit,
+    onPulseMouse: () -> Unit = {},
     imeVisible: Boolean,
     imeText: String,
     onImeText: (String) -> Unit,
@@ -331,6 +347,22 @@ fun ConnectScreenContent(
                 valueRange = 0f..7f,
                 steps = 6,
             )
+            Text(
+                "Glasses refresh $refreshHz Hz" +
+                    if (stereo && refreshHz == 120) " (3D max 90)" else "",
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Slider(
+                value = refreshHz.toFloat(),
+                onValueChange = { onRefreshHz(it.toInt()) },
+                valueRange = 60f..120f,
+                steps = 1,
+            )
+            Text(
+                "60 / 90 / 120 — default 90 avoids ghosting; 120 only if Real FPS holds.",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.secondary,
+            )
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -388,11 +420,19 @@ fun ConnectScreenContent(
                 )
                 Text(
                     if (moveScreen) "Move screen is on in Settings — drag to place, two fingers = distance."
+                    else if (focused == GlassesViewModel.DESKTOP) {
+                        "1 finger move/click · 2 finger scroll/pinch/right-click · 3 finger apps/Task View"
+                    }
                     else if (presenting) "One finger = pointer. Tap = click. Two fingers = scroll. Pinch = zoom. Three fingers = back / forward."
                     else "Glasses display not separate — OEM may be mirroring the phone.",
                     fontSize = 13.sp,
                     color = MaterialTheme.colorScheme.secondary,
                 )
+                if (focused == GlassesViewModel.DESKTOP) {
+                    OutlinedButton(onClick = onPulseMouse) {
+                        Text("Test mouse pulse")
+                    }
+                }
                 SpatialImeBar(
                     visible = imeVisible,
                     text = imeText,
@@ -404,6 +444,7 @@ fun ConnectScreenContent(
                     cursorX = cursorX,
                     cursorY = cursorY,
                     moveScreen = moveScreen,
+                    showCursor = focused != GlassesViewModel.DESKTOP,
                     onNudge = onNudge,
                     onDown = onDown,
                     onUp = onUp,
@@ -412,6 +453,9 @@ fun ConnectScreenContent(
                     onScroll = onScroll,
                     onPinch = onPinch,
                     onThreeSwipe = onThreeSwipe,
+                    onThreeSwipeVert = onThreeSwipeVert,
+                    onTwoFingerTap = onTwoFingerTap,
+                    onThreeTap = onThreeTap,
                     modifier = Modifier
                         .fillMaxWidth()
                         .weight(1f),
@@ -456,7 +500,11 @@ fun Trackpad(
     onScroll: (Float, Float) -> Unit,
     onPinch: (Float) -> Unit,
     onThreeSwipe: (Float) -> Unit,
+    onThreeSwipeVert: (Float) -> Unit = {},
+    onTwoFingerTap: () -> Unit = {},
+    onThreeTap: () -> Unit = {},
     modifier: Modifier = Modifier,
+    showCursor: Boolean = true,
 ) {
     val session = remember { TrackpadTouch() }
     val disallow = remember { RequestDisallowInterceptTouchEvent() }
@@ -471,6 +519,9 @@ fun Trackpad(
     val onScrollState = rememberUpdatedState(onScroll)
     val onPinchState = rememberUpdatedState(onPinch)
     val onThreeSwipeState = rememberUpdatedState(onThreeSwipe)
+    val onThreeSwipeVertState = rememberUpdatedState(onThreeSwipeVert)
+    val onTwoFingerTapState = rememberUpdatedState(onTwoFingerTap)
+    val onThreeTapState = rememberUpdatedState(onThreeTap)
     Box(
         modifier = modifier
             .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(16.dp))
@@ -507,6 +558,9 @@ fun Trackpad(
                         is TrackpadCmd.Pinch -> onPinchState.value(cmd.factor)
                         is TrackpadCmd.Distance -> onZoomState.value(cmd.dyNorm)
                         is TrackpadCmd.ThreeSwipe -> onThreeSwipeState.value(cmd.dir)
+                        is TrackpadCmd.ThreeSwipeVert -> onThreeSwipeVertState.value(cmd.dir)
+                        TrackpadCmd.TwoFingerTap -> onTwoFingerTapState.value()
+                        TrackpadCmd.ThreeTap -> onThreeTapState.value()
                         is TrackpadCmd.Up -> onUpState.value(cmd.click)
                     }
                 }
@@ -514,7 +568,7 @@ fun Trackpad(
             },
         contentAlignment = Alignment.Center,
     ) {
-        if (!moveScreen) {
+        if (!moveScreen && showCursor) {
             Canvas(Modifier.fillMaxSize()) {
                 val x = cursorX * size.width
                 val y = (cursorY.coerceIn(0f, 1.2f) / 1.2f) * size.height
@@ -527,7 +581,14 @@ fun Trackpad(
                 )
             }
         }
-        Text(if (moveScreen) "Move screen" else "Trackpad", color = MaterialTheme.colorScheme.secondary)
+        Text(
+            when {
+                moveScreen -> "Move screen"
+                !showCursor -> "Trackpad → PC mouse"
+                else -> "Trackpad"
+            },
+            color = MaterialTheme.colorScheme.secondary,
+        )
     }
 }
 

@@ -12,11 +12,11 @@ class ShellAppsTest {
         val ids = ShellApps.launcherIds()
         assertEquals(ShellApps.SCREEN, ids[0])
         assertEquals(ShellApps.EXTENDED, ids[1])
-        assertEquals("web:youtube", ids[2])
-        assertEquals("web:parsec", ids[3])
+        assertEquals(ShellApps.STEAMVR, ids[2])
+        assertEquals(ShellApps.DESKTOP, ids[3])
         assertTrue(ids.size > 20)
         assertTrue(ids.contains("web:netflix"))
-        assertEquals(WebApps.catalog.map { it.component }, ids.drop(2))
+        assertEquals(WebApps.catalog.map { it.component }, ids.drop(4))
     }
 
     @Test

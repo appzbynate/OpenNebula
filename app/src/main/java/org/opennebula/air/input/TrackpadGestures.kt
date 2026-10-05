@@ -12,7 +12,12 @@ sealed class TrackpadCmd {
     data class Scroll(val dxNorm: Float, val dyNorm: Float) : TrackpadCmd()
     data class Pinch(val factor: Float) : TrackpadCmd()
     data class Distance(val dyNorm: Float) : TrackpadCmd()
+    /** Horizontal three-finger swipe: -1 left, +1 right. */
     data class ThreeSwipe(val dir: Float) : TrackpadCmd()
+    /** Vertical three-finger swipe: -1 up, +1 down (screen coords). */
+    data class ThreeSwipeVert(val dir: Float) : TrackpadCmd()
+    data object TwoFingerTap : TrackpadCmd()
+    data object ThreeTap : TrackpadCmd()
     data class Up(val click: Boolean) : TrackpadCmd()
 }
 
@@ -29,6 +34,12 @@ object TrackpadGestures {
         val threshold = width * THREE_SWIPE_FRAC
         if (abs(dx) < threshold) return null
         return if (dx > 0f) 1f else -1f
+    }
+
+    fun threeSwipeVertDir(dy: Float, height: Float): Float? {
+        val threshold = height * THREE_SWIPE_FRAC
+        if (abs(dy) < threshold) return null
+        return if (dy > 0f) 1f else -1f
     }
 
     fun centroidX(fingers: List<TrackpadFinger>): Float {
@@ -63,26 +74,32 @@ class TrackpadTouch(
     private var usedMulti = false
     private var sawThree = false
     private var travel = 0f
+    private var twoFingerTravel = 0f
     private var lastOneX: Float? = null
     private var lastOneY: Float? = null
     private var lastSpan: Float? = null
     private var lastCentroidX: Float? = null
     private var lastCentroidY: Float? = null
     private var threeStartX: Float? = null
+    private var threeStartY: Float? = null
     private var threeLastX = 0f
+    private var threeLastY = 0f
 
     fun reset() {
         downConfirmed = false
         usedMulti = false
         sawThree = false
         travel = 0f
+        twoFingerTravel = 0f
         lastOneX = null
         lastOneY = null
         lastSpan = null
         lastCentroidX = null
         lastCentroidY = null
         threeStartX = null
+        threeStartY = null
         threeLastX = 0f
+        threeLastY = 0f
     }
 
     fun update(fingers: List<TrackpadFinger>): List<TrackpadCmd> {
@@ -94,8 +111,11 @@ class TrackpadTouch(
             usedMulti = true
             sawThree = true
             val cx = TrackpadGestures.centroidX(fingers)
+            val cy = TrackpadGestures.centroidY(fingers)
             if (threeStartX == null) threeStartX = cx
+            if (threeStartY == null) threeStartY = cy
             threeLastX = cx
+            threeLastY = cy
             clearTwoFinger()
             return cmds
         }
@@ -119,6 +139,7 @@ class TrackpadTouch(
                 val panX = cx - prevCx
                 val panY = cy - prevCy
                 val panMag = hypot(panX, panY)
+                twoFingerTravel += panMag
                 val spanDelta = abs(span - prevSpan)
                 val w = width.coerceAtLeast(1f)
                 val h = height.coerceAtLeast(1f)
@@ -161,10 +182,19 @@ class TrackpadTouch(
             cmds += TrackpadCmd.Up(!moveScreen && travel < TrackpadGestures.TAP_SLOP_PX)
         } else {
             if (sawThree && !moveScreen) {
-                TrackpadGestures.threeSwipeDir(
-                    threeLastX - (threeStartX ?: threeLastX),
-                    width.coerceAtLeast(1f),
-                )?.let { cmds += TrackpadCmd.ThreeSwipe(it) }
+                val dx = threeLastX - (threeStartX ?: threeLastX)
+                val dy = threeLastY - (threeStartY ?: threeLastY)
+                val w = width.coerceAtLeast(1f)
+                val h = height.coerceAtLeast(1f)
+                val horiz = TrackpadGestures.threeSwipeDir(dx, w)
+                val vert = TrackpadGestures.threeSwipeVertDir(dy, h)
+                when {
+                    horiz != null && abs(dx) >= abs(dy) -> cmds += TrackpadCmd.ThreeSwipe(horiz)
+                    vert != null -> cmds += TrackpadCmd.ThreeSwipeVert(vert)
+                    else -> cmds += TrackpadCmd.ThreeTap
+                }
+            } else if (!sawThree && !moveScreen && twoFingerTravel < TrackpadGestures.TAP_SLOP_PX) {
+                cmds += TrackpadCmd.TwoFingerTap
             }
             cmds += TrackpadCmd.Up(false)
         }

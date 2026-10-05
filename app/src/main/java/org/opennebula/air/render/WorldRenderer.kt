@@ -1,11 +1,15 @@
 package org.opennebula.air.render
 
+import android.graphics.Bitmap
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
 import android.opengl.GLUtils
+import android.os.Process
+import android.os.SystemClock
 import android.util.Log
 import org.opennebula.air.browser.SpatialBrowser
 import org.opennebula.air.imu.Orientation
+import org.opennebula.air.imu.Vec3f
 import org.opennebula.air.logging.LogTags
 import org.opennebula.air.mirror.MirrorPipeline
 import org.opennebula.air.shell.ChromeHandle
@@ -22,6 +26,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
@@ -48,6 +53,8 @@ class WorldRenderer(
     private val browser: MirrorPipeline,
     private val steamVr: MirrorPipeline,
     private val desktop: MirrorPipeline,
+    private val targetRefreshHz: AtomicInteger = AtomicInteger(90),
+    private val gyroRef: AtomicReference<Vec3f> = AtomicReference(Vec3f(0f, 0f, 0f)),
 ) : GLSurfaceView.Renderer {
     private var colorProg = 0
     private var texProg = 0
@@ -62,6 +69,12 @@ class WorldRenderer(
     private var aTexUv = 0
     private var surfaceW = 1
     private var surfaceH = 1
+
+    /** Actual GPU submit FPS (not Android display mode Hz). */
+    private var fpsLastNs = 0L
+    private var fpsWindowStartNs = 0L
+    private var fpsFrames = 0
+    private var lastLoggedFps = -1
 
     private lateinit var envTris: FloatBuffer
     private var envTriCount = 0
@@ -79,14 +92,24 @@ class WorldRenderer(
 
     private val gpu = ArrayList<GpuLayer>()
     private var mirrorTex = 0
+    private var mirrorTexW = 0
+    private var mirrorTexH = 0
     private var lastMirrorGen = -1
     private var lastMirrorPose: SpatialWindow? = null
     private var browserTex = 0
+    private var browserTexW = 0
+    private var browserTexH = 0
     private var lastBrowserGen = -1
     private var steamVrTex = 0
+    private var steamVrTexW = 0
+    private var steamVrTexH = 0
     private var lastSteamVrGen = -1
     private var desktopTex = 0
+    private var desktopTexW = 0
+    private var desktopTexH = 0
     private var lastDesktopGen = -1
+
+
     private lateinit var mirrorPanelTris: FloatBuffer
     private var mirrorPanelCount = 0
     private lateinit var mirrorBezelTris: FloatBuffer
@@ -146,6 +169,7 @@ class WorldRenderer(
     )
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
+        Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
         GLES20.glClearColor(0f, 0f, 0f, 0f)
         GLES20.glEnable(GLES20.GL_DEPTH_TEST)
         GLES20.glDisable(GLES20.GL_CULL_FACE)
@@ -176,9 +200,18 @@ class WorldRenderer(
         gpu.clear()
         // Home/Notes Compose panels stay off-screen; the icon grid and ImageReader browser replace them.
         mirrorTex = genTex()
+        mirrorTexW = 0
+        mirrorTexH = 0
         browserTex = genTex()
+        browserTexW = 0
+        browserTexH = 0
         steamVrTex = genTex()
+        steamVrTexW = 0
+        steamVrTexH = 0
         desktopTex = genTex()
+        desktopTexW = 0
+        desktopTexH = 0
+
         val mp = mirror.pose.get()
         lastMirrorPose = mp
         mirrorBezelTris = pack(buildBezel(mp))
@@ -240,10 +273,49 @@ class WorldRenderer(
     }
 
     override fun onDrawFrame(gl: GL10?) {
+        tickRealFps()
         try {
             drawWorld()
         } catch (t: Throwable) {
             Log.e(LogTags.DISPLAY, "onDrawFrame failed", t)
+        }
+    }
+
+    fun setTargetFps(hz: Int) {
+        targetRefreshHz.set(hz.coerceIn(60, 120))
+    }
+
+    /**
+     * Measure wall-clock rate of [onDrawFrame] submissions — not Display.getMode().refreshRate.
+     * Log once per second so we can tell target Hz vs frame-duplication judder.
+     */
+    private fun tickRealFps() {
+        val now = SystemClock.elapsedRealtimeNanos()
+        if (fpsWindowStartNs == 0L) {
+            fpsWindowStartNs = now
+            fpsLastNs = now
+            fpsFrames = 0
+            return
+        }
+        fpsFrames++
+        fpsLastNs = now
+        val elapsedNs = now - fpsWindowStartNs
+        if (elapsedNs < 1_000_000_000L) return
+        val fps = (fpsFrames * 1_000_000_000.0 / elapsedNs).toInt()
+        fpsWindowStartNs = now
+        fpsFrames = 0
+        val target = targetRefreshHz.get()
+        if (fps != lastLoggedFps) {
+            lastLoggedFps = fps
+            val note = when {
+                fps >= (target - 5) -> "OK matched ~${target}Hz"
+                fps >= 90 -> "SOFT — SurfaceFlinger may duplicate to ${target}Hz (ghosting)"
+                else -> "CHOKE — frame duplication likely at ${target}Hz panel"
+            }
+            Log.i(
+                LogTags.FPS,
+                "Real FPS: $fps (target $target) — $note — turn head; Real must stay near target",
+            )
         }
     }
 
@@ -254,10 +326,51 @@ class WorldRenderer(
         uploadSteamVr()
         uploadDesktop()
         uploadIcons()
-        // Raw fusion → view (motion-smooth 0.8.93 caused complaint; restore baseline display).
-        // Tag baseline-0.8.92 remains the full restore point.
-        val raw = poseRef.get()
-        val centerView = PoseMath.viewFromQuat(raw.qw, raw.qx, raw.qy, raw.qz)
+
+        // ─── Gyro-extrapolated pose prediction (ATW-lite) ───────────────────────────────
+        //
+        // poseRef.get() holds the IMU fusion result from the last USB packet received.
+        // By the time these photons reach the eye, the following latency has elapsed:
+        //   IMU→poseRef write   ≈  1 ms
+        //   Render thread wake  ≈  1 ms  (GL RENDERMODE_CONTINUOUSLY on vsync)
+        //   GL submit + driver  ≈  5 ms
+        //   SurfaceFlinger      ≈  4 ms
+        //   DP Alt-Mode scanout ≈  8 ms  (1-2 vblank periods)
+        //   Panel response      ≈  8 ms  (OLED 8ms grey-to-grey typical)
+        //                             ≈ 27 ms total, capped at PREDICT_LEAD_MAX_S (30ms)
+        //
+        // We forward-integrate the last known angular velocity over this latency using the
+        // exact SO(3) exponential map — the same math used in the Madgwick fusion step.
+        // This compensates for display pipeline lag without adding a prediction loop or
+        // introducing velocity smoothing (which caused stick-slip in 0.9.70).
+        //
+        val latentPose = poseRef.get()
+        val g = gyroRef.get()
+        val raw = if (g.x == 0f && g.y == 0f && g.z == 0f) {
+            latentPose
+        } else {
+            // Refresh-adaptive motion-to-photon latency:
+            // Total display pipeline is ~1.7 frames (GL queue + SurfaceFlinger + DP Alt-Mode scanout):
+            //   At 90Hz:  1.7 * 11.1ms = 18.9ms
+            //   At 120Hz: 1.7 * 8.3ms  = 14.1ms
+            //   At 60Hz:  1.7 * 16.7ms = 28.3ms
+            val hz = targetRefreshHz.get().coerceIn(60, 120).toFloat()
+            val leadS = (1.7f / hz).coerceIn(0.010f, PoseMath.PREDICT_LEAD_MAX_S)
+            val pq = PoseMath.integrateQuat(
+                latentPose.qw, latentPose.qx, latentPose.qy, latentPose.qz,
+                g.x, g.y, g.z,
+                leadS,
+            )
+            Orientation(
+                yawDeg = latentPose.yawDeg,
+                pitchDeg = latentPose.pitchDeg,
+                rollDeg = latentPose.rollDeg,
+                qw = pq[0], qx = pq[1], qy = pq[2], qz = pq[3],
+            )
+        }
+        // ────────────────────────────────────────────────────────────────────────────────
+
+        val centerView = PoseMath.viewFromQuat(raw.qw, raw.qx, raw.qy, raw.qz, neckModel = false)
         val panelX = SpatialLayout.PANEL_X
         val panelY = SpatialLayout.PANEL_Y
         val panelZ = SpatialLayout.PANEL_Z
@@ -295,6 +408,18 @@ class WorldRenderer(
             return
         }
         GLES20.glClearColor(0f, 0f, 0f, 0f)
+
+        // Prepare dynamic overlay geometry once per frame (avoids duplicate work in stereo passes)
+        val hasWindow = browser.enabled.get() || mirror.enabled.get() || desktop.enabled.get()
+        if (hasWindow) {
+            placeCursor()
+            chromeCount = writeChrome()
+        }
+        val beam = pointerBeam.get()
+        if (beam.active) {
+            placeLaser(beam)
+        }
+
         val stereo = stereoEnabled.get() && surfaceW >= 2
         if (stereo) {
             val half = surfaceW / 2
@@ -349,14 +474,11 @@ class WorldRenderer(
         drawWindows(mvp)
         val hasWindow = browser.enabled.get() || mirror.enabled.get() || desktop.enabled.get()
         if (hasWindow) {
-            placeCursor()
             drawColor(mvp, cursorTris, cursorCount, GLES20.GL_TRIANGLES)
-            chromeCount = writeChrome()
             drawColor(mvp, chromeTris, chromeCount, GLES20.GL_TRIANGLES)
         }
         val beam = pointerBeam.get()
         if (beam.active) {
-            placeLaser(beam)
             GLES20.glDisable(GLES20.GL_DEPTH_TEST)
             drawColor(mvp, laserLines, LASER_VERTS, GLES20.GL_TRIANGLES)
             drawColor(mvp, laserDot, laserDotCount, GLES20.GL_TRIANGLES)
@@ -443,13 +565,26 @@ class WorldRenderer(
         }
     }
 
+    private fun uploadSubTex(tex: Int, bmp: Bitmap, curW: Int, curH: Int): Pair<Int, Int> {
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, tex)
+        val w = bmp.width
+        val h = bmp.height
+        if (w != curW || h != curH) {
+            GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
+        } else {
+            GLUtils.texSubImage2D(GLES20.GL_TEXTURE_2D, 0, 0, 0, bmp)
+        }
+        return Pair(w, h)
+    }
+
     private fun uploadMirror() {
         if (!mirror.enabled.get()) return
         val gen = mirror.generation.get()
         if (gen != lastMirrorGen) {
             mirror.withBitmap { bmp ->
-                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, mirrorTex)
-                GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
+                val (w, h) = uploadSubTex(mirrorTex, bmp, mirrorTexW, mirrorTexH)
+                mirrorTexW = w
+                mirrorTexH = h
             }
             lastMirrorGen = gen
         }
@@ -470,8 +605,9 @@ class WorldRenderer(
         val gen = browser.generation.get()
         if (gen != lastBrowserGen) {
             browser.withBitmap { bmp ->
-                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, browserTex)
-                GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
+                val (w, h) = uploadSubTex(browserTex, bmp, browserTexW, browserTexH)
+                browserTexW = w
+                browserTexH = h
             }
             lastBrowserGen = gen
         }
@@ -493,8 +629,9 @@ class WorldRenderer(
         if (gen != lastSteamVrGen) {
             var uploaded = false
             steamVr.withBitmap { bmp ->
-                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, steamVrTex)
-                GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
+                val (w, h) = uploadSubTex(steamVrTex, bmp, steamVrTexW, steamVrTexH)
+                steamVrTexW = w
+                steamVrTexH = h
                 uploaded = true
             }
             // Only advance gen when a bitmap was actually uploaded (avoid stuck black tex).
@@ -518,8 +655,9 @@ class WorldRenderer(
         if (gen != lastDesktopGen) {
             var uploaded = false
             desktop.withBitmap { bmp ->
-                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, desktopTex)
-                GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
+                val (w, h) = uploadSubTex(desktopTex, bmp, desktopTexW, desktopTexH)
+                desktopTexW = w
+                desktopTexH = h
                 uploaded = true
             }
             if (uploaded) lastDesktopGen = gen
@@ -688,9 +826,9 @@ class WorldRenderer(
                 v = steamVr.cursorY.get()
             }
             id == MirrorPipeline.DESKTOP_ID && desktop.enabled.get() -> {
-                window = desktop.pose.get()
-                u = desktop.cursorX.get()
-                v = desktop.cursorY.get()
+                // Real Windows cursor is composited into the stream — no XR overlay.
+                cursorCount = 0
+                return
             }
             else -> {
                 cursorCount = 0
@@ -800,10 +938,9 @@ class WorldRenderer(
         val ly = WindowChrome.localIconY(ChromeHandle.HEIGHT, window, expanded = true)
         val w = WindowChrome.pillWidth()
         val h = WindowChrome.pillHeight()
-        windowCapsule(data, window, 0f, ly, 0.028f, w * 1.04f, h * 1.18f, 0.55f, 0.58f, 0.64f, 0.16f)
-        windowCapsule(data, window, 0f, ly, 0.030f, w, h, 0.86f, 0.89f, 0.94f, 0.30f)
-        windowCapsule(data, window, 0f, ly + h * 0.22f, 0.032f, w * 0.86f, h * 0.18f, 0.98f, 0.99f, 1f, 0.22f)
-        windowCapsuleStroke(data, window, 0f, ly, 0.033f, w, h, 0.96f, 0.97f, 0.99f, 0.42f)
+        // Soft fill only — no end-cap stroke / specular strip (those cut through OFFSET/DISTANCE).
+        windowCapsule(data, window, 0f, ly, 0.028f, w * 1.04f, h * 1.18f, 0.55f, 0.58f, 0.64f, 0.14f)
+        windowCapsule(data, window, 0f, ly, 0.030f, w, h, 0.86f, 0.89f, 0.94f, 0.28f)
     }
 
     private fun appendGrabHandle(
@@ -1192,7 +1329,7 @@ class WorldRenderer(
 
     private fun buildLaser(beam: PointerBeam): ArrayList<Float> {
         val pose = poseRef.get()
-        val view = PoseMath.viewFromQuat(pose.qw, pose.qx, pose.qy, pose.qz)
+        val view = PoseMath.viewFromQuat(pose.qw, pose.qx, pose.qy, pose.qz, neckModel = false)
         val origin = PoseMath.worldFromViewLocal(view, PHONE_X, PHONE_Y, PHONE_Z)
         val data = ArrayList<Float>(LASER_FLOATS)
         beamQuad(

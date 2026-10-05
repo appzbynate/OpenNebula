@@ -36,13 +36,13 @@ class XrVideoClient(
             try {
                 Socket().use { sock ->
                     sock.tcpNoDelay = true
-                    // Tiny recv buffer — prefer drop over queuing stale frames.
-                    runCatching { sock.receiveBufferSize = 128 * 1024 }
+                    // Prefer drop over queuing stale frames (gaming latency).
+                    runCatching { sock.receiveBufferSize = 48 * 1024 }
                     sock.connect(InetSocketAddress(address, port), 4_000)
                     onStatus("video linked")
                     onLog("video ← $address:$port")
                     pipeline.setActive(true)
-                    val input = DataInputStream(BufferedInputStream(sock.getInputStream(), 32 * 1024))
+                    val input = DataInputStream(BufferedInputStream(sock.getInputStream(), 16 * 1024))
                     val header = ByteArray(8)
                     val opts = BitmapFactory.Options().apply {
                         inPreferredConfig = Bitmap.Config.ARGB_8888

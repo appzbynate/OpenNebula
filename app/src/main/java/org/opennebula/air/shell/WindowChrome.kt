@@ -72,7 +72,8 @@ object WindowChrome {
     const val HANDLE_H = 0.042f
     const val PILL_H = 0.168f
     const val HANDLE_DROP = 0.110f
-    const val HOVER_HIT = 1.35f
+    /** Keep hover inflate modest so tools don't steal the panel bottom edge. */
+    const val HOVER_HIT = 1.12f
     const val GLYPH_HOVER = 2f
 
     fun localIconX(handle: ChromeHandle, expanded: Boolean, window: SpatialWindow = SpatialWindow()): Float {
@@ -220,12 +221,19 @@ object WindowChrome {
     ): ChromeHandle? {
         var best: ChromeHandle? = null
         var bestD = Float.MAX_VALUE
+        val panelBottom = -window.height / 2f
         for (handle in handles(expanded)) {
             val cx = localIconX(handle, expanded, window)
             val cy = localIconY(handle, window, expanded)
             val live = hoveredHandle == handle
             val hx = hitHalfX(handle, expanded, grabbed && handle != ChromeHandle.HUB, live)
-            val hy = hitHalfY(handle, expanded, grabbed && handle != ChromeHandle.HUB, live)
+            var hy = hitHalfY(handle, expanded, grabbed && handle != ChromeHandle.HUB, live)
+            // Dock tools: clamp hit box so it cannot reach into panel content.
+            if (handle != ChromeHandle.CLOSE && handle != ChromeHandle.BACK) {
+                val maxTop = panelBottom - 0.004f
+                hy = min(hy, maxTop - cy)
+                if (hy <= 0f) continue
+            }
             val dx = abs(lx - cx)
             val dy = abs(ly - cy)
             if (dx <= hx && dy <= hy) {

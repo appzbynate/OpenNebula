@@ -63,6 +63,9 @@ fun InputOverlay(
     onScroll: (Float, Float) -> Unit,
     onPinch: (Float) -> Unit,
     onThreeSwipe: (Float) -> Unit,
+    onThreeSwipeVert: (Float) -> Unit = {},
+    onTwoFingerTap: () -> Unit = {},
+    onThreeTap: () -> Unit = {},
     onImeText: (String) -> Unit,
     onToggleIme: () -> Unit,
     onHideIme: () -> Unit,
@@ -84,6 +87,7 @@ fun InputOverlay(
             onMode = onMode,
             onAnchor = onAnchor,
             onTap = { onUp(true) },
+            showAnchor = false,
         )
         SpatialImeBar(
             visible = imeVisible,
@@ -109,6 +113,9 @@ fun InputOverlay(
                 onScroll = onScroll,
                 onPinch = onPinch,
                 onThreeSwipe = onThreeSwipe,
+                onThreeSwipeVert = onThreeSwipeVert,
+                onTwoFingerTap = onTwoFingerTap,
+                onThreeTap = onThreeTap,
                 modifier = Modifier.fillMaxSize(),
             )
         }
@@ -300,20 +307,27 @@ fun ModeChrome(
             ModeButton("Trackpad", mode == InputMode.TRACKPAD) { onMode(InputMode.TRACKPAD) }
             ModeButton("Pointer", mode == InputMode.POINTER) { onMode(InputMode.POINTER) }
         }
-        if (showAnchor || mode == InputMode.POINTER || !compact) {
+        // World Anchor/Recenter is IMU sensor lock — keep it off Pointer/Trackpad chrome
+        // so tapping Pointer never feels like a sensor recalibration.
+        if (showAnchor) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                if (showAnchor) {
-                    Button(onClick = onAnchor) {
-                        Text(if (worldLocked) "Recenter" else "Anchor")
-                    }
+                Button(onClick = onAnchor) {
+                    Text(if (worldLocked) "Recenter" else "Anchor")
                 }
                 if (!compact) {
                     Button(onClick = onTap) { Text("Click") }
                 }
+            }
+        } else if (!compact) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Button(onClick = onTap) { Text("Click") }
             }
         }
     }

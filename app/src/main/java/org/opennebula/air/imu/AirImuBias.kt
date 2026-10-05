@@ -8,18 +8,32 @@ data class Quatf(
     val y: Float,
     val z: Float,
 ) {
+    val isIdentity: Boolean
+        get() = w == 1f && x == 0f && y == 0f && z == 0f
+
+    fun rotateVec(vx: Float, vy: Float, vz: Float): Vec3f {
+        val cx = y * vz - z * vy
+        val cy = z * vx - x * vz
+        val cz = x * vy - y * vx
+        return Vec3f(
+            vx + 2f * w * cx + 2f * (y * cz - z * cy),
+            vy + 2f * w * cy + 2f * (z * cx - x * cz),
+            vz + 2f * w * cz + 2f * (x * cy - y * cx),
+        )
+    }
+
     companion object {
         val IDENTITY = Quatf(1f, 0f, 0f, 0f)
     }
 }
 
 /**
- * Factory IMU zeros from the glasses JSON (`IMU.device_1`).
+ * Factory IMU calibration from glasses EEPROM JSON (`IMU.device_1`).
  *
- * Matches ar-drivers-rs exactly: after the X-neg / Y↔Z remap, apply only
- * `gyro_bias` / `accel_bias` with signs (−, +, +). Scale / misalignment are
- * parsed for logs but **not** applied — ar-drivers ignores them in the sample
- * path, and earlier mixed-sign attempts made tracking worse.
+ * Implements reference Monado OpenXR pipeline (`xreal_air_hmd.c`):
+ * 1. Rotate raw sensor gyro vector by `accel_q_gyro` die misalignment quaternion.
+ * 2. Remap to pre-biased frame (RUB), subtract factory bias, and multiply by `scale_gyro` / `scale_accel`.
+ * 3. Convert to body OpenGL coordinate system (-X, +Z, +Y).
  */
 data class AirImuBias(
     val gyroBiasRad: Vec3f,
@@ -30,24 +44,45 @@ data class AirImuBias(
 ) {
     val isZero: Boolean
         get() = gyroBiasRad.x == 0f && gyroBiasRad.y == 0f && gyroBiasRad.z == 0f &&
-            accelBiasMps2.x == 0f && accelBiasMps2.y == 0f && accelBiasMps2.z == 0f
+            accelBiasMps2.x == 0f && accelBiasMps2.y == 0f && accelBiasMps2.z == 0f &&
+            scaleGyro.x == 1f && scaleGyro.y == 1f && scaleGyro.z == 1f &&
+            scaleAccel.x == 1f && scaleAccel.y == 1f && scaleAccel.z == 1f &&
+            accelQGyro.isIdentity
 
     fun apply(sample: ImuSample): ImuSample {
         if (isZero) return sample
-        val gx = ImuParser.dpsToRadS(sample.gyroDps.x)
-        val gy = ImuParser.dpsToRadS(sample.gyroDps.y)
-        val gz = ImuParser.dpsToRadS(sample.gyroDps.z)
+
+        // Reconstruct raw sensor frame from remapped sample (RUB: -X, Z, Y).
+        val rawGx = ImuParser.dpsToRadS(-sample.gyroDps.x)
+        val rawGy = ImuParser.dpsToRadS(sample.gyroDps.z)
+        val rawGz = ImuParser.dpsToRadS(sample.gyroDps.y)
+
+        // 1. Rotate gyro by accel_q_gyro die misalignment quaternion
+        val rotG = accelQGyro.rotateVec(rawGx, rawGy, rawGz)
+
+        // 2. Monado pre_biased (-x, -z, -y) - bias * scale -> post_biased (x, -y, -z)
+        val outRadX = (-rotG.x - gyroBiasRad.x) * scaleGyro.x
+        val outRadY = (rotG.z + gyroBiasRad.y) * scaleGyro.y
+        val outRadZ = (rotG.y + gyroBiasRad.z) * scaleGyro.z
+
         val gyro = Vec3f(
-            Math.toDegrees((gx - gyroBiasRad.x).toDouble()).toFloat(),
-            Math.toDegrees((gy + gyroBiasRad.y).toDouble()).toFloat(),
-            Math.toDegrees((gz + gyroBiasRad.z).toDouble()).toFloat(),
+            Math.toDegrees(outRadX.toDouble()).toFloat(),
+            Math.toDegrees(outRadY.toDouble()).toFloat(),
+            Math.toDegrees(outRadZ.toDouble()).toFloat(),
         )
-        val accel = Vec3f(
-            sample.accelMps2.x - accelBiasMps2.x,
-            sample.accelMps2.y + accelBiasMps2.y,
-            sample.accelMps2.z + accelBiasMps2.z,
-        )
+
+        // Accelerometer calibration
+        val rawAx = -sample.accelMps2.x
+        val rawAy = sample.accelMps2.z
+        val rawAz = sample.accelMps2.y
+
+        val outAx = (-rawAx - accelBiasMps2.x) * scaleAccel.x
+        val outAy = (rawAz + accelBiasMps2.y) * scaleAccel.y
+        val outAz = (rawAy + accelBiasMps2.z) * scaleAccel.z
+
+        val accel = Vec3f(outAx, outAy, outAz)
         val tilt = ImuParser.tiltFromAccel(accel)
+
         return sample.copy(
             accelMps2 = accel,
             gyroDps = gyro,
@@ -58,7 +93,8 @@ data class AirImuBias(
 
     fun toLogLine(): String {
         return "gyro_bias_rad=$gyroBiasRad accel_bias=$accelBiasMps2 " +
-            "scale_gyro=$scaleGyro(unused) scale_accel=$scaleAccel(unused)"
+            "scale_gyro=$scaleGyro scale_accel=$scaleAccel " +
+            "accel_q_gyro=(w=${"%.4f".format(accelQGyro.w)},x=${"%.4f".format(accelQGyro.x)},y=${"%.4f".format(accelQGyro.y)},z=${"%.4f".format(accelQGyro.z)})"
     }
 
     companion object {

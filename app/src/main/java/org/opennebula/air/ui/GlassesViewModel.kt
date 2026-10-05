@@ -210,6 +210,8 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
     val stereo: StateFlow<Boolean> = _stereo.asStateFlow()
     private val _brightness = MutableStateFlow(5)
     val brightness: StateFlow<Int> = _brightness.asStateFlow()
+    private val _refreshHz = MutableStateFlow(90)
+    val refreshHz: StateFlow<Int> = _refreshHz.asStateFlow()
     /** Stereo preference before SteamVR forced hardware 3D; restored on disconnect. */
     private var stereoBeforeSteamVr: Boolean? = null
 
@@ -251,6 +253,12 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
     var requestBrowserAudio: (() -> Unit)? = null
     private var screenAspect = 9f / 20f
     private var padHeld = false
+    /** Sub-pixel remainder so small trackpad moves aren't truncated to 0. */
+    private var desktopRelAccX = 0f
+    private var desktopRelAccY = 0f
+    private var desktopWheelAccV = 0f
+    private var desktopWheelAccH = 0f
+    private var desktopZoomAcc = 0f
     private var grabPitch = 0f
     private var grabYaw = 0f
     private var grabRoll = 0f
@@ -525,17 +533,21 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
         mirror.setCaptureSize(w, h)
         val hideGrid = mirrorHidesGrid
         mirrorHidesGrid = false
-        val offset = if (hideGrid) 0f else -1.55f
         val scale = if (hideGrid) 1.28f else 1.1f
-        mirror.pose.set(
-            SpatialWindow.fromControls(
-                -SpatialLayout.PANEL_Z,
-                SpatialLayout.PANEL_Y,
-                scale,
-                offset,
-                screenAspect,
-            ),
-        )
+        if (hideGrid) {
+            placeWindowInViewCenter(scale, screenAspect) { mirror.pose.set(it) }
+        } else {
+            // Alongside an existing window — slight side offset is OK.
+            mirror.pose.set(
+                SpatialWindow.fromControls(
+                    -SpatialLayout.PANEL_Z,
+                    SpatialLayout.PANEL_Y,
+                    scale,
+                    -1.55f,
+                    screenAspect,
+                ),
+            )
+        }
         capture?.stop()
         val mgr = activity.getSystemService(MediaProjectionManager::class.java)
         capture = MirrorCapture(activity.applicationContext, mgr, mirror) { stopMirroring() }
@@ -622,13 +634,15 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
         displays.requestFrameNow()
         persist()
         viewModelScope.launch(Dispatchers.IO) {
-            val ok = runCatching { client.setDisplayMode3d(enabled) }.getOrDefault(false)
+            val ok = runCatching {
+                client.setRefreshRateHz(_refreshHz.value, stereo3d = enabled)
+            }.getOrDefault(false)
             hardware3dFlag.set(enabled && ok)
             displays.refreshModeStatus()
             displays.requestFrameNow()
             appendLog(
                 LogTags.USB,
-                if (ok) "hardware ${if (enabled) "3D SBS" else "2D"} applied"
+                if (ok) "hardware ${if (enabled) "3D SBS" else "2D"} @ ${_refreshHz.value}Hz"
                 else "hardware display mode failed (software stereo still ${if (enabled) "on" else "off"})",
             )
         }
@@ -638,7 +652,33 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
         val v = level.coerceIn(0, 7)
         _brightness.value = v
         persist()
-        // MCU USB deferred — do not touch iface 4 until connect is stable again.
+        viewModelScope.launch(Dispatchers.IO) {
+            val ok = runCatching { client.setBrightness(v) }.getOrDefault(false)
+            appendLog(
+                LogTags.USB,
+                if (ok) "brightness MCU level=$v"
+                else "brightness MCU failed level=$v (glasses connected?)",
+            )
+        }
+    }
+
+    fun setRefreshHz(hz: Int) {
+        val rate = org.opennebula.air.protocol.NrealAirProtocol.snapRefreshHz(hz)
+        _refreshHz.value = rate
+        displays.setPreferredRefreshHz(rate)
+        remoteDesktop.setRefreshHz(rate)
+        persist()
+        viewModelScope.launch(Dispatchers.IO) {
+            val stereo3d = hardware3dFlag.get()
+            val ok = runCatching { client.setRefreshRateHz(rate, stereo3d) }.getOrDefault(false)
+            val note = when {
+                !ok -> "refresh ${rate}Hz MCU failed"
+                stereo3d && rate == 120 -> "refresh MCU 90Hz SBS (no 120 in 3D) + GL/desktop target ${rate}Hz"
+                else -> "refresh MCU ${rate}Hz + GL/desktop target ${rate}Hz"
+            }
+            appendLog(LogTags.USB, note)
+            displays.refreshModeStatus()
+        }
     }
 
     /** Always boot the session in 2D; user toggles hardware 3D explicitly. */
@@ -646,15 +686,21 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
         _stereo.value = false
         stereoFlag.set(false)
         hardware3dFlag.set(false)
+        displays.setPreferredRefreshHz(_refreshHz.value)
         displays.refreshModeStatus()
         displays.requestFrameNow()
         persist()
         viewModelScope.launch(Dispatchers.IO) {
-            val ok = runCatching { client.setDisplayMode3d(false) }.getOrDefault(false)
+            val refreshOk = runCatching {
+                client.setRefreshRateHz(_refreshHz.value, stereo3d = false)
+            }.getOrDefault(false)
+            val brightOk = runCatching {
+                client.setBrightness(_brightness.value)
+            }.getOrDefault(false)
             appendLog(
                 LogTags.USB,
-                if (ok) "connect → hardware 2D"
-                else "connect → hardware 2D request failed (UI stays 2D)",
+                "connect → 2D @ ${_refreshHz.value}Hz refresh=${if (refreshOk) "ok" else "fail"} " +
+                    "brightness=${_brightness.value}/${if (brightOk) "ok" else "fail"}",
             )
         }
     }
@@ -733,6 +779,34 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
         publishWindow(yaw = 0f, pitch = 0f, roll = 0f)
     }
 
+    /**
+     * Place a floating panel centered in front of the user (stable world slot).
+     * Avoids head-relative spawn that starts high/tilted when looking up.
+     */
+    private fun placeWindowInViewCenter(
+        scale: Float,
+        aspect: Float,
+        applyTo: (SpatialWindow) -> Unit,
+    ): SpatialWindow {
+        val s = scale.coerceIn(SpatialWindow.SCALE_MIN, SpatialWindow.SCALE_MAX)
+        val window = SpatialWindow.fromControls(
+            -SpatialLayout.PANEL_Z,
+            SpatialLayout.PANEL_Y,
+            s,
+            SpatialLayout.PANEL_X,
+            aspect,
+            yaw = 0f,
+            pitch = 0f,
+            roll = 0f,
+        )
+        applyTo(window)
+        _distance.value = window.distance
+        _panelHeight.value = window.y
+        _panelScale.value = s
+        _offsetX.value = window.x
+        return window
+    }
+
     private fun publishWindow(
         yaw: Float? = null,
         pitch: Float? = null,
@@ -803,6 +877,7 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
         hardware3dFlag.set(false)
         val ipd = prefs.ipdMeters()
         _brightness.value = prefs.brightness()
+        _refreshHz.value = prefs.refreshHz()
         _ipd.value = ipd
         ipdRef.set(ipd)
         _distance.value = prefs.distance()
@@ -823,6 +898,7 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
         prefs.save(
             stereo = _stereo.value,
             brightness = _brightness.value,
+            refreshHz = _refreshHz.value,
             ipdMeters = _ipd.value,
             distance = _distance.value,
             height = _panelHeight.value,
@@ -871,6 +947,14 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
         if (id == DESKTOP) {
             focusedId.set(DESKTOP)
             _focused.value = DESKTOP
+            // Extend mode leaves TRACKPAD overlay up — that hid the main pad.
+            _moveScreen.value = false
+            setInputMode(InputMode.CONTROLS)
+            chrome.grabHandle.set(null)
+            collapseChrome()
+            hubOwnsPointer = false
+            grabPoseArmed = false
+            lastHubDir = null
             val pose = desktopPipeline.pose.get()
             _distance.value = pose.distance
             _panelHeight.value = pose.y
@@ -934,23 +1018,10 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
         val target = url.trim().ifBlank { SpatialBrowser.DEFAULT_URL }
         requestBrowserAudio?.invoke()
         gridOpen.set(false)
-        browser.pose.set(
-            SpatialWindow.fromControls(
-                -SpatialLayout.PANEL_Z,
-                SpatialLayout.PANEL_Y,
-                1.12f,
-                0f,
-                SpatialBrowser.ASPECT,
-            ),
-        )
+        placeWindowInViewCenter(1.12f, SpatialBrowser.ASPECT) { browser.pose.set(it) }
         browser.launch(target)
         focusedId.set(SpatialBrowser.ID)
         _focused.value = SpatialBrowser.ID
-        val pose = browser.pose.get()
-        _distance.value = pose.distance
-        _panelHeight.value = pose.y
-        _panelScale.value = pose.width / SpatialLayout.PANEL_W
-        _offsetX.value = pose.x
         displays.requestFrameNow()
         appendLog(LogTags.BROWSER, "open $target")
     }
@@ -1022,6 +1093,8 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
     fun openRemoteDesktop() {
         browser.cancelPointer()
         collapseChrome()
+        _moveScreen.value = false
+        setInputMode(InputMode.CONTROLS)
         if (remoteDesktop.isConnected()) {
             focus(DESKTOP)
             gridOpen.set(false)
@@ -1035,19 +1108,45 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
     fun selectRemoteDesktopHost(host: XrHost) = remoteDesktop.select(host)
     fun setRemoteDesktopIp(ip: String) = remoteDesktop.setManualIp(ip)
     fun connectRemoteDesktop() {
+        // Keep Controls mode so the phone trackpad stays on the main screen
+        // (TRACKPAD mode swaps to InputOverlay and felt like "no trackpad").
+        _moveScreen.value = false
+        setInputMode(InputMode.CONTROLS)
+        remoteDesktop.setRefreshHz(_refreshHz.value)
         remoteDesktop.connect()
         viewModelScope.launch {
             val state = remoteDesktop.ui.first { !it.busy }
             if (state.connected) {
                 gridOpen.set(false)
+                chrome.grabHandle.set(null)
+                collapseChrome()
+                placeWindowInViewCenter(1.25f, 16f / 9f) { desktopPipeline.pose.set(it) }
                 focus(DESKTOP)
                 displays.requestFrameNow()
+                appendLog(
+                    LogTags.UI,
+                    "desktop ready @ ${_refreshHz.value}Hz target — swipe trackpad for PC mouse",
+                )
             }
         }
     }
     fun disconnectRemoteDesktop() {
         remoteDesktop.disconnect()
         showGrid()
+    }
+
+    /** Debug: prove control socket moves the Windows cursor. */
+    fun pulseDesktopMouse() {
+        if (!remoteDesktop.isConnected()) {
+            appendLog(LogTags.UI, "pulse: remote desktop not connected")
+            return
+        }
+        remoteDesktop.moveRel(60, 0)
+        viewModelScope.launch {
+            kotlinx.coroutines.delay(100)
+            remoteDesktop.moveRel(-60, 0)
+            appendLog(LogTags.UI, "pulse: sent REL ±60 — cursor should wiggle")
+        }
     }
 
     fun closeBrowser() {
@@ -1130,12 +1229,10 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun setPointerAiming(on: Boolean) {
-        if (_pointerAiming.value == on) {
-            if (on) calibratePointer()
-            return
-        }
+        if (_pointerAiming.value == on) return
         _pointerAiming.value = on
         if (on) {
+            // Zero phone-aim relative yaw/pitch only — never IMU bias / world Anchor.
             pointerNeedsCalibrate = true
             pointerBeam.set(PointerBeam(0f, 0f, SpatialLayout.PANEL_Z, true))
             startPhonePointer()
@@ -1150,6 +1247,7 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    /** Re-zero phone pointer aim relative to current phone pose (not glasses IMU). */
     fun calibratePointer() {
         pointerNeedsCalibrate = true
     }
@@ -1221,6 +1319,7 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
         if (chromeHit != null && chromeT <= nearest + 1e-4f) {
             iconGrid.hoverComponent.set(null)
             if (focusedId.get() != chromeHit.layerId) focus(chromeHit.layerId)
+            // Pointer may aim at Remote Desktop chrome (move/resize/close) — not the PC desktop.
             chrome.expandedLayer.set(chromeHit.layerId)
             chrome.hoverLayer.set(chromeHit.layerId)
             chrome.hoverHandle.set(chromeHit.handle)
@@ -1231,10 +1330,13 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
         if (panelHit != null && panelT <= nearest + 1e-4f) {
             iconGrid.hoverComponent.set(null)
             if (focusedId.get() != panelHit.layerId) focus(panelHit.layerId)
-            setCursor(panelHit.u, panelHit.v)
+            // Remote Desktop content: pointer does not enter the PC — trackpad owns that cursor.
             if (panelHit.layerId == DESKTOP && remoteDesktop.isConnected()) {
-                remoteDesktop.movePointer(panelHit.u, panelHit.v.coerceIn(0f, 1f))
+                collapseChrome()
+                pointerBeam.set(PointerBeam(panelHit.x, panelHit.y, panelHit.z, true))
+                return
             }
+            setCursor(panelHit.u, panelHit.v)
             val travel = hypot(panelHit.u - lastPointerU, panelHit.v - lastPointerV) * 420f
             haptics.onMove(travel)
             lastPointerU = panelHit.u
@@ -1279,7 +1381,14 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
             return
         }
         if (handle == null && focusedId.get() == DESKTOP && remoteDesktop.isConnected()) {
-            remoteDesktop.pointerDown(0f, 0f)
+            // Finger on pad = trackpad mouse (content), not chrome — chrome needs a hover hit.
+            chrome.grabHandle.set(null)
+            return
+        }
+        // Desktop up + pad on empty air: keep trackpad mouse, but never when chrome is hovered.
+        if (handle == null && remoteDesktop.isConnected() && desktopPipeline.enabled.get()) {
+            chrome.grabHandle.set(null)
+            if (focusedId.get() != DESKTOP) focus(DESKTOP)
             return
         }
         val layer = chrome.hoverLayer.get() ?: chrome.expandedLayer.get()
@@ -1343,8 +1452,23 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
             )
             return
         }
+        // After pointer chrome adjust on Remote Desktop, keep world pose as-is.
         if (focusedId.get() == DESKTOP && remoteDesktop.isConnected()) {
-            remoteDesktop.pointerUp(0f, 0f)
+            if (grab != null) {
+                if (grab == ChromeHandle.CLOSE) {
+                    closeFocusedWindow()
+                    return
+                }
+                if (grab == ChromeHandle.BACK) {
+                    goBackOrHome()
+                    return
+                }
+                return
+            }
+            if (click) {
+                haptics.click()
+                remoteDesktop.trackpadClick()
+            }
             return
         }
         if (grab == ChromeHandle.CLOSE) {
@@ -1376,6 +1500,25 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
 
     fun nudgePad(dxNorm: Float, dyNorm: Float, pixels: Float = 0f) {
         val grab = chrome.grabHandle.get()
+        // Remote Desktop: trackpad owns the PC mouse only when not grabbing chrome.
+        // Pointer aimed at hub/size/close must keep pad moves for window controls.
+        val desktopLayerUp = remoteDesktop.isConnected() && desktopPipeline.enabled.get()
+        if (desktopLayerUp && !_moveScreen.value && grab == null) {
+            if (focusedId.get() != DESKTOP) focus(DESKTOP)
+            val gain = 1.75f
+            desktopRelAccX += dxNorm * 1920f * gain
+            desktopRelAccY += dyNorm * 1080f * gain
+            val dx = desktopRelAccX.toInt()
+            val dy = desktopRelAccY.toInt()
+            desktopRelAccX -= dx.toFloat()
+            desktopRelAccY -= dy.toFloat()
+            if (dx != 0 || dy != 0) {
+                remoteDesktop.moveRel(dx, dy)
+            }
+            haptics.onMove(pixels)
+            return
+        }
+        // Chrome grab (pointer aimed at hub/size/…) adjusts the window — not the PC mouse.
         if (grab == ChromeHandle.HUB) {
             _distance.value = (_distance.value - dyNorm * 2.8f)
                 .coerceIn(SpatialWindow.DIST_MIN, SpatialWindow.DIST_MAX)
@@ -1414,21 +1557,6 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
             haptics.onMove(pixels)
             return
         }
-        // Remote Desktop: phone trackpad = relative Windows mouse (laptop-style).
-        if (focusedId.get() == DESKTOP && remoteDesktop.isConnected() && !_moveScreen.value) {
-            if (chrome.hoverHandle.get() != null) {
-                nudgeCursor(dxNorm, dyNorm)
-                updateChromeFromCursor()
-                haptics.onMove(pixels)
-                return
-            }
-            val sens = 1100f
-            val dx = (dxNorm * sens).toInt()
-            val dy = (dyNorm * sens).toInt()
-            remoteDesktop.moveRel(dx, dy)
-            haptics.onMove(pixels)
-            return
-        }
         if (_moveScreen.value) {
             setOffsetX(_offsetX.value + dxNorm * 1.5f)
             setPanelHeight(_panelHeight.value - dyNorm * 0.9f)
@@ -1449,9 +1577,15 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
             return
         }
         if (focused == DESKTOP && remoteDesktop.isConnected()) {
-            // Two-finger style: vertical pad scroll → mouse wheel
-            val ticks = (-dyNorm * 8f).toInt()
-            if (ticks != 0) remoteDesktop.wheel(ticks)
+            // Two-finger pan → mouse wheel. Match Windows trackpad: fingers up → content up.
+            desktopWheelAccV += dyNorm * 10f
+            desktopWheelAccH += -dxNorm * 10f
+            val v = desktopWheelAccV.toInt()
+            val h = desktopWheelAccH.toInt()
+            desktopWheelAccV -= v.toFloat()
+            desktopWheelAccH -= h.toFloat()
+            if (v != 0) remoteDesktop.wheel(v)
+            if (h != 0) remoteDesktop.hWheel(h)
             return
         }
         if (focused == HOME && gridOpen.get() && chrome.grabHandle.get() == null) {
@@ -1490,15 +1624,58 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
             browser.zoomBy(factor)
             return
         }
+        // Remote Desktop: pinch → Ctrl+wheel zoom (not panel distance).
+        if (focusedId.get() == DESKTOP && remoteDesktop.isConnected() && !_moveScreen.value) {
+            desktopZoomAcc += (factor - 1f) * 14f
+            val ticks = desktopZoomAcc.toInt()
+            desktopZoomAcc -= ticks.toFloat()
+            if (ticks != 0) remoteDesktop.zoom(ticks)
+            return
+        }
         zoomDistance((1f - factor) * 1.4f)
     }
 
+    fun padTwoFingerTap() {
+        if (focusedId.get() == DESKTOP && remoteDesktop.isConnected()) {
+            remoteDesktop.trackpadClick(button = 1) // right click
+            haptics.click()
+        }
+    }
+
+    fun padThreeTap() {
+        if (focusedId.get() == DESKTOP && remoteDesktop.isConnected()) {
+            remoteDesktop.trackpadClick(button = 2) // middle click
+            haptics.click()
+        }
+    }
+
     fun padThreeSwipe(dir: Float) {
+        if (focusedId.get() == DESKTOP && remoteDesktop.isConnected()) {
+            // 3-finger left/right → switch apps (Alt+Tab / Alt+Shift+Tab)
+            if (dir < 0f) {
+                remoteDesktop.chord(0x12, 0x10, 0x09) // Alt+Shift+Tab
+            } else {
+                remoteDesktop.chord(0x12, 0x09) // Alt+Tab
+            }
+            haptics.click()
+            return
+        }
         if (focusedId.get() != SpatialBrowser.ID || !browser.running) return
         if (dir < 0f) {
             browser.injectKey(android.view.KeyEvent.KEYCODE_BACK)
         } else {
             browser.goForward()
+        }
+        haptics.click()
+    }
+
+    fun padThreeSwipeVert(dir: Float) {
+        if (focusedId.get() != DESKTOP || !remoteDesktop.isConnected()) return
+        // Screen Y: up is negative → Task View; down → Show desktop
+        if (dir < 0f) {
+            remoteDesktop.chord(0x5B, 0x09) // Win+Tab
+        } else {
+            remoteDesktop.chord(0x5B, 0x44) // Win+D
         }
         haptics.click()
     }
@@ -1536,6 +1713,10 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun zoomDistance(dyNorm: Float) {
+        if (focusedId.get() == DESKTOP && remoteDesktop.isConnected() && chrome.grabHandle.get() == null) {
+            // Two-finger pinch must not push the panel away — wheel handles scroll.
+            return
+        }
         _distance.value = (_distance.value - dyNorm * 2.4f)
             .coerceIn(SpatialWindow.DIST_MIN, SpatialWindow.DIST_MAX)
         if (chrome.grabHandle.get() == ChromeHandle.HUB) {
@@ -1596,8 +1777,7 @@ class GlassesViewModel(application: Application) : AndroidViewModel(application)
             return
         }
         if (focusedId.get() == DESKTOP && remoteDesktop.isConnected()) {
-            haptics.click()
-            remoteDesktop.trackpadClick()
+            // Already handled as trackpadClick in padUp when click=true.
             return
         }
         haptics.click()

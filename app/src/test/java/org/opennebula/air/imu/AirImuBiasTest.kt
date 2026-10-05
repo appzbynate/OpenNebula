@@ -57,12 +57,13 @@ class AirImuBiasTest {
     }
 
     @Test
-    fun apply_ignores_scale_like_ar_drivers() {
+    fun apply_applies_scale_and_quaternion_rotation() {
         val bias = AirImuBias(
             gyroBiasRad = Vec3f(0f, 0f, 0f),
             accelBiasMps2 = Vec3f(0f, 0f, 0f),
-            scaleGyro = Vec3f(2f, 2f, 2f),
-            scaleAccel = Vec3f(2f, 2f, 2f),
+            scaleGyro = Vec3f(1.1f, 1.2f, 0.9f),
+            scaleAccel = Vec3f(1.05f, 0.95f, 1.0f),
+            accelQGyro = Quatf.IDENTITY,
         )
         val sample = ImuSample(
             source = ImuParserSource.AIR_PACKED,
@@ -75,9 +76,19 @@ class AirImuBiasTest {
             pitchDeg = 0f,
             rollDeg = 0f,
         )
-        // isZero is true when bias vectors are zero — scale must not change sample.
-        assertEquals(true, bias.isZero)
-        assertEquals(sample, bias.apply(sample))
+        assertEquals(false, bias.isZero)
+        val out = bias.apply(sample)
+        assertEquals(11.0f, out.gyroDps.x, 1e-3f)
+        assertEquals(24.0f, out.gyroDps.y, 1e-3f)
+        assertEquals(27.0f, out.gyroDps.z, 1e-3f)
+        assertEquals(1.05f, out.accelMps2.x, 1e-4f)
+        assertEquals(1.90f, out.accelMps2.y, 1e-4f)
+        assertEquals(3.0f, out.accelMps2.z, 1e-4f)
+    }
+
+    @Test
+    fun isZero_is_true_only_for_defaults() {
+        assertEquals(true, AirImuBias.ZERO.isZero)
     }
 
     @Test

@@ -12,6 +12,7 @@ import android.hardware.usb.UsbEndpoint
 import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
 import android.os.Build
+import android.os.Process
 import android.os.SystemClock
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
@@ -407,7 +408,28 @@ class NrealAirUsbClient(
         } else {
             intArrayOf(NrealAirProtocol.DISPLAY_MODE_2D)
         }
-        mcuDiag("setDisplayMode3d enabled=$enabled targets=${targets.joinToString()}")
+        return setDisplayModeTargets(targets, enabled = enabled)
+    }
+
+    /**
+     * Apply MCU mode for [hz] (60/90/120). Mirror supports 120; SBS tops out at 90.
+     * Returns true when SET appears accepted.
+     */
+    fun setRefreshRateHz(hz: Int, stereo3d: Boolean): Boolean {
+        val rate = NrealAirProtocol.snapRefreshHz(hz)
+        val want = NrealAirProtocol.displayModeForRefresh(rate, stereo3d)
+        mcuDiagClear()
+        mcuDiag("setRefreshRateHz hz=$rate stereo=$stereo3d mode=$want")
+        emit(LogTags.USB, "MCU refresh ${rate}Hz stereo=$stereo3d → mode=$want")
+        val ok = setDisplayModeTargets(intArrayOf(want), enabled = stereo3d)
+        if (ok && stereo3d && rate == 120) {
+            emit(LogTags.USB, "SBS has no 120Hz — using mode 9 (90Hz SBS)")
+        }
+        return ok
+    }
+
+    private fun setDisplayModeTargets(targets: IntArray, enabled: Boolean): Boolean {
+        mcuDiag("setDisplayModeTargets enabled=$enabled targets=${targets.joinToString()}")
         data class McuModeResult(val mode: Int?, val wroteUnverified: Boolean)
         val result = withMcuClaimed { conn, iface, inEp, outEp ->
             var applied: Int? = null
@@ -446,31 +468,70 @@ class NrealAirUsbClient(
                     wroteUnverified = got == null
                     break
                 }
+                // 2D high-refresh: accept SET ack even when GET stays on another 2D mode.
+                if (setOk && !enabled) {
+                    applied = want
+                    wroteUnverified = got == null || got != want
+                    break
+                }
             }
             McuModeResult(applied, wroteUnverified)
         }
         val mode = result?.mode
-        val ok = when {
-            enabled -> mode != null && mode != NrealAirProtocol.DISPLAY_MODE_2D
-            else -> mode == NrealAirProtocol.DISPLAY_MODE_2D
-        }
+        val ok = mode != null
         if (result?.wroteUnverified == true) {
             mcuDiag("SET wrote but GET unverified — check glasses for blanking/3D")
         }
         mcuDiag("result mode=$mode ok=$ok")
-        emit(
-            LogTags.USB,
-            if (ok) "hardware display mode OK mode=$mode"
-            else "hardware display mode FAILED (see ${File(diagDir, "mcu_last.txt").absolutePath})",
-        )
+        emit(LogTags.USB, "MCU display mode result=$mode ok=$ok")
         return ok
     }
 
-    fun getBrightness(): Int? = null
+    fun getBrightness(): Int? {
+        return withMcuClaimed { conn, iface, inEp, outEp ->
+            val data = transactMcu(
+                conn, iface, inEp, outEp,
+                NrealAirProtocol.MCU_CMD_GET_BRIGHTNESS,
+                ByteArray(0),
+            ) ?: return@withMcuClaimed null
+            data.getOrNull(1)?.toInt()?.and(0xFF)?.coerceIn(
+                NrealAirProtocol.BRIGHTNESS_MIN,
+                NrealAirProtocol.BRIGHTNESS_MAX,
+            )
+        }
+    }
 
     fun setBrightness(level: Int): Boolean {
-        emit(LogTags.USB, "MCU brightness still deferred level=$level")
-        return false
+        val v = level.coerceIn(NrealAirProtocol.BRIGHTNESS_MIN, NrealAirProtocol.BRIGHTNESS_MAX)
+        mcuDiagClear()
+        mcuDiag("setBrightness level=$v")
+        emit(LogTags.USB, "MCU SET brightness=$v")
+        val result = withMcuClaimed { conn, iface, inEp, outEp ->
+            val ack = transactMcu(
+                conn, iface, inEp, outEp,
+                NrealAirProtocol.MCU_CMD_SET_BRIGHTNESS,
+                byteArrayOf(v.toByte()),
+            )
+            if (ack == null) {
+                mcuDiag("SET brightness write failed")
+                return@withMcuClaimed false
+            }
+            val setOk = ack.isEmpty() || (ack[0].toInt() and 0xFF) == 0
+            mcuDiag("SET brightness ack=${ack.toHex(8)} setOk=$setOk")
+            emit(LogTags.USB, "MCU SET brightness=$v ack=${ack.toHex(8)} setOk=$setOk")
+            if (!setOk) return@withMcuClaimed false
+            Thread.sleep(80)
+            val got = transactMcu(
+                conn, iface, inEp, outEp,
+                NrealAirProtocol.MCU_CMD_GET_BRIGHTNESS,
+                ByteArray(0),
+            )?.getOrNull(1)?.toInt()?.and(0xFF)
+            mcuDiag("GET brightness → $got (want $v)")
+            got == null || got == v || setOk
+        }
+        val ok = result == true
+        emit(LogTags.USB, if (ok) "MCU brightness OK level=$v" else "MCU brightness FAILED level=$v")
+        return ok
     }
 
     private fun mcuDiagClear() {
@@ -925,6 +986,7 @@ class NrealAirUsbClient(
      * process on Android 16 (Nubia NX789J) before any IMU bytes arrived.
      */
     private suspend fun bulkLoop(conn: UsbDeviceConnection, inEp: UsbEndpoint) {
+        Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
         val packetSize = maxOf(inEp.maxPacketSize, NrealAirProtocol.PACKET_SIZE)
         val buffer = ByteArray(packetSize)
         val stats = RateTracker()
@@ -949,29 +1011,44 @@ class NrealAirUsbClient(
                 continue
             }
             timeouts = 0
-            onPacket(buffer.copyOf(n), stats)
+            onPacket(buffer, n, stats)
+
+            // DRAIN BACKLOG: If packets queued up in the kernel FIFO (e.g. from GC, UI events,
+            // or thread scheduling), drain them immediately with 1ms timeout. When packets are
+            // already waiting, bulkTransfer returns immediately (<25 µs), eliminating pipeline
+            // lag and keeping IMU orientation locked to real-time.
+            while (readerRunning && coroutineContext.isActive) {
+                val nextN = try {
+                    conn.bulkTransfer(inEp, buffer, packetSize, 1)
+                } catch (t: Throwable) {
+                    break
+                }
+                if (nextN <= 0) break
+                onPacket(buffer, nextN, stats)
+            }
         }
     }
 
-    private fun onPacket(packet: ByteArray, stats: RateTracker) {
+    private fun onPacket(packet: ByteArray, length: Int, stats: RateTracker) {
         stats.onPacket()
         val hz = stats.maybePacketsPerSec()
         if (hz != null) {
             _state.value = GlassesConnectionState.Streaming(hz)
         }
         if (stats.total <= 3) {
-            emit(LogTags.IMU_RAW, "pkt#${stats.total} ${packet.size}B ${packet.toHex()}")
+            emit(LogTags.IMU_RAW, "pkt#${stats.total} ${length}B ${packet.toHex(length)}")
         }
-        if (ImuParser.isImuControlFrame(packet)) {
+        if (ImuParser.isImuControlFrame(packet, length)) {
             if (stats.total <= 8) {
-                emit(LogTags.IMU, "control frame ${packet.toHex(16)}")
+                emit(LogTags.IMU, "control frame ${packet.toHex(minOf(16, length))}")
             }
             return
         }
-        val sample = runCatching { ImuParser.parse(packet) }.getOrNull() ?: return
-        // Factory JSON bias signs disagree with live rest on this unit (trace still
-        // showed ~−2.5°/s Y after apply). Rest-bias warmup alone matches the gyro.
-        val calibrated = sample
+        val sample = ImuParser.parse(packet, length) ?: return
+        // Factory flash cal removes most static gyro bias (XReal community: ~1°/s →
+        // near-zero still drift when applied). Live Madgwick warmup then eats residual.
+        // Skipping apply left world-lock crawling even after Anchor.
+        val calibrated = imuBias.apply(sample)
         val epoch = poseEpoch.get()
         val pose = fusion.update(calibrated)
         if (epoch != poseEpoch.get()) return
@@ -989,8 +1066,9 @@ class NrealAirUsbClient(
             _latestSample.value = calibrated
             _orientation.value = pose
             onImuDebug?.invoke(
-                "${fusion.clockLogLine()} gravity=rest-only display=raw depth=${"%.2f".format(-org.opennebula.air.shell.SpatialLayout.PANEL_Z)}m " +
-                    "axis=${ImuParser.AIR_AXIS_LABEL} " +
+                "${fusion.clockLogLine()} fusion=x-io gain=${MadgwickImu.GAIN} " +
+                    "display=raw depth=${"%.2f".format(-org.opennebula.air.shell.SpatialLayout.PANEL_Z)}m " +
+                    "axis=${ImuParser.AIR_AXIS_LABEL} factory=${if (imuBias.isZero) "off" else "on"} " +
                     "gyro=${"%.1f".format(calibrated.gyroDps.x)},${"%.1f".format(calibrated.gyroDps.y)},${"%.1f".format(calibrated.gyroDps.z)} " +
                     "q=${"%.3f".format(pose.qw)},${"%.3f".format(pose.qx)},${"%.3f".format(pose.qy)},${"%.3f".format(pose.qz)} " +
                     "${fusion.biasLogLine()}",

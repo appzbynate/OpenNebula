@@ -17,3 +17,8 @@ app/debug
 /tmp/
 tools/xr-bridge/.venv/
 tools/xr-bridge/hmd_driver/
+diag_latest/
+debug-screen.png
+*.png
+*.log
+tools/xr-bridge/rel_log.txt

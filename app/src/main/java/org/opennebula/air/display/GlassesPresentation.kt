@@ -6,12 +6,12 @@ import android.graphics.PixelFormat
 import android.opengl.GLSurfaceView
 import android.os.Build
 import android.os.Bundle
+import android.util.Log
 import android.view.Display
 import android.view.WindowManager
-import javax.microedition.khronos.egl.EGL10
-import javax.microedition.khronos.egl.EGLConfig
-import javax.microedition.khronos.egl.EGLDisplay
 import org.opennebula.air.imu.Orientation
+import org.opennebula.air.imu.Vec3f
+import org.opennebula.air.logging.LogTags
 import org.opennebula.air.mirror.MirrorPipeline
 import org.opennebula.air.render.PointerBeam
 import org.opennebula.air.render.WorldRenderer
@@ -20,6 +20,7 @@ import org.opennebula.air.shell.SpatialLayer
 import org.opennebula.air.shell.SpatialWindow
 import org.opennebula.air.shell.WindowChromeState
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
 class GlassesPresentation(
@@ -41,18 +42,26 @@ class GlassesPresentation(
     browser: MirrorPipeline,
     steamVr: MirrorPipeline,
     desktop: MirrorPipeline,
+    gyroRef: AtomicReference<Vec3f> = AtomicReference(Vec3f(0f, 0f, 0f)),
 ) : Presentation(context, display, android.R.style.Theme_Black_NoTitleBar_Fullscreen) {
+
+    private val preferredRefreshHz = AtomicInteger(90)
 
     private val renderer = WorldRenderer(
         poseRef, layers, focusedId, showMarkers, stereoEnabled, hardware3d, ipdMeters, pointerBeam, mirror, chrome,
         iconGrid, gridOpen, gridPose, browser, steamVr, desktop,
+        preferredRefreshHz,
+        gyroRef = gyroRef,
     )
     private val surface = GLSurfaceView(context).apply {
         setEGLContextClientVersion(2)
-        // 2× MSAA: 4× on SBS stereo was heavy enough to drop frames (judder ≈ vibration).
-        setEGLConfigChooser(MsaaConfigChooser(2))
+        // No MSAA — soft edges smear worse on sample-and-hold OLED; saves GPU for 120 FPS.
+        setEGLConfigChooser(8, 8, 8, 8, 16, 0)
         preserveEGLContextOnPause = true
         setRenderer(renderer)
+        // CONTINUOUSLY vsyncs to *this* Presentation's display (glasses), not the phone.
+        // Phone Choreographer + WHEN_DIRTY locked us to phone 60/90 while glasses ran 120,
+        // so SurfaceFlinger duplicated frames → ghosting / judder while turning the head.
         renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
         keepScreenOn = true
     }
@@ -61,11 +70,18 @@ class GlassesPresentation(
         surface.requestRender()
     }
 
+    /** Prefer an Android display mode near [hz] (MCU sets the glasses panel separately). */
+    fun setPreferredRefreshHz(hz: Int) {
+        preferredRefreshHz.set(hz.coerceIn(60, 120))
+        preferRefresh(display, preferredRefreshHz.get())
+        renderer.setTargetFps(preferredRefreshHz.get())
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         window?.setFormat(PixelFormat.TRANSLUCENT)
-        preferHighestRefresh(display)
+        preferRefresh(display, preferredRefreshHz.get())
         surface.holder.setFormat(PixelFormat.TRANSLUCENT)
         setContentView(surface)
     }
@@ -80,56 +96,23 @@ class GlassesPresentation(
         super.onStop()
     }
 
-    private fun preferHighestRefresh(display: Display) {
+    private fun preferRefresh(display: Display, targetHz: Int) {
         if (Build.VERSION.SDK_INT < 23) return
-        val best = display.supportedModes.maxByOrNull { it.refreshRate } ?: return
+        val modes = display.supportedModes
+        if (modes.isEmpty()) return
+        val best = modes.minByOrNull { kotlin.math.abs(it.refreshRate - targetHz) } ?: return
         val lp = window?.attributes ?: return
         lp.preferredDisplayModeId = best.modeId
+        if (Build.VERSION.SDK_INT >= 30) {
+            lp.preferredRefreshRate = targetHz.toFloat()
+        }
         window?.attributes = lp
-    }
-}
-
-private class MsaaConfigChooser(
-    private val preferredSamples: Int,
-) : GLSurfaceView.EGLConfigChooser {
-    override fun chooseConfig(egl: EGL10, display: EGLDisplay): EGLConfig {
-        val order = intArrayOf(preferredSamples, 4, 2, 0)
-        for (samples in order) {
-            pick(egl, display, samples)?.let { return it }
-        }
-        error("No EGL config for OpenGL ES 2")
-    }
-
-    private fun pick(egl: EGL10, display: EGLDisplay, samples: Int): EGLConfig? {
-        val spec = ArrayList<Int>(24)
-        spec.add(EGL10.EGL_RED_SIZE)
-        spec.add(8)
-        spec.add(EGL10.EGL_GREEN_SIZE)
-        spec.add(8)
-        spec.add(EGL10.EGL_BLUE_SIZE)
-        spec.add(8)
-        spec.add(EGL10.EGL_ALPHA_SIZE)
-        spec.add(8)
-        spec.add(EGL10.EGL_DEPTH_SIZE)
-        spec.add(16)
-        spec.add(EGL10.EGL_RENDERABLE_TYPE)
-        spec.add(EGL_OPENGL_ES2_BIT)
-        if (samples > 0) {
-            spec.add(EGL10.EGL_SAMPLE_BUFFERS)
-            spec.add(1)
-            spec.add(EGL10.EGL_SAMPLES)
-            spec.add(samples)
-        }
-        spec.add(EGL10.EGL_NONE)
-        val configs = arrayOfNulls<EGLConfig>(1)
-        val n = IntArray(1)
-        if (!egl.eglChooseConfig(display, spec.toIntArray(), configs, 1, n) || n[0] < 1) {
-            return null
-        }
-        return configs[0]
-    }
-
-    companion object {
-        private const val EGL_OPENGL_ES2_BIT = 4
+        Log.i(
+            LogTags.DISPLAY,
+            "preferRefresh: target=${targetHz}Hz -> selected modeId=${best.modeId} " +
+                "(${best.physicalWidth}x${best.physicalHeight}@${"%.1f".format(best.refreshRate)}Hz), " +
+                "currentDisplayMode=${display.mode.modeId} (${"%.1f".format(display.mode.refreshRate)}Hz), " +
+                "supportedModes=[${modes.joinToString { "${it.modeId}:${"%.0f".format(it.refreshRate)}Hz" }}]",
+        )
     }
 }

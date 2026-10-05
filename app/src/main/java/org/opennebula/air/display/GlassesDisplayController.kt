@@ -2,6 +2,7 @@ package org.opennebula.air.display
 
 import android.app.Activity
 import android.hardware.display.DisplayManager
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -48,6 +49,7 @@ class GlassesDisplayController(
 ) {
     private val main = Handler(Looper.getMainLooper())
     private val poseRef = AtomicReference(Orientation.IDENTITY)
+    private val gyroRef = AtomicReference(Vec3f(0f, 0f, 0f))
     private val _status = MutableStateFlow(GlassesDisplayStatus("Glasses display: none", false))
     val status: StateFlow<GlassesDisplayStatus> = _status.asStateFlow()
 
@@ -55,6 +57,7 @@ class GlassesDisplayController(
     private var displayManager: DisplayManager? = null
     @Volatile private var presentation: GlassesPresentation? = null
     private var targetId: Int? = null
+    @Volatile private var preferredRefreshHz: Int = 90
 
     private val listener = object : DisplayManager.DisplayListener {
         override fun onDisplayAdded(displayId: Int) {
@@ -94,12 +97,18 @@ class GlassesDisplayController(
         activity = null
     }
 
-    fun publishPose(pose: Orientation, @Suppress("UNUSED_PARAMETER") gyroRadS: Vec3f = Vec3f(0f, 0f, 0f)) {
+    fun publishPose(pose: Orientation, gyroRadS: Vec3f = Vec3f(0f, 0f, 0f)) {
         poseRef.set(pose)
+        gyroRef.set(gyroRadS)
     }
 
     fun requestFrameNow() {
         presentation?.requestFrame()
+    }
+
+    fun setPreferredRefreshHz(hz: Int) {
+        preferredRefreshHz = hz.coerceIn(60, 120)
+        presentation?.setPreferredRefreshHz(preferredRefreshHz)
     }
 
     fun refreshModeStatus() {
@@ -144,11 +153,13 @@ class GlassesDisplayController(
             browser,
             steamVr,
             desktop,
+            gyroRef = gyroRef,
         )
         runCatching {
             next.show()
             presentation = next
             targetId = target.displayId
+            next.setPreferredRefreshHz(preferredRefreshHz)
             presentation?.requestFrame()
             val msg = "presenting on ${describe(target)} — ${modeLabel()}"
             emit(msg)
@@ -210,7 +221,14 @@ class GlassesDisplayController(
     }
 
     private fun describe(d: Display): String {
-        return "${d.name} ${d.mode.physicalWidth}x${d.mode.physicalHeight} id=${d.displayId}"
+        val hz = "%.0f".format(d.mode.refreshRate)
+        val modes = if (Build.VERSION.SDK_INT >= 23) {
+            d.supportedModes.joinToString(",") { "%.0f".format(it.refreshRate) }
+        } else {
+            hz
+        }
+        return "${d.name} ${d.mode.physicalWidth}x${d.mode.physicalHeight}@${hz}Hz " +
+            "id=${d.displayId} modes=[$modes]"
     }
 
     private fun emit(message: String) {

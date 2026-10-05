@@ -1,6 +1,7 @@
 package org.opennebula.air.shell
 
 import android.content.Context
+import org.opennebula.air.protocol.NrealAirProtocol
 import org.opennebula.air.render.StereoConfig
 
 class DisplayPrefs(context: Context) {
@@ -10,6 +11,13 @@ class DisplayPrefs(context: Context) {
     fun stereo(): Boolean = false
 
     fun brightness(): Int = prefs.getInt(BRIGHTNESS, 5).coerceIn(0, 7)
+
+    /**
+     * Preferred glasses panel rate: 60, 90, or 120.
+     * Default 90 — match Real FPS (~90) to panel so SurfaceFlinger does not duplicate
+     * frames at 120 (ghosting). Raise to 120 only when Logcat Real FPS holds ~120.
+     */
+    fun refreshHz(): Int = NrealAirProtocol.snapRefreshHz(prefs.getInt(REFRESH_HZ, 90))
 
     fun ipdMeters(): Float = prefs.getFloat(IPD, StereoConfig.IPD_METERS)
         .coerceIn(StereoConfig.IPD_MIN, StereoConfig.IPD_MAX)
@@ -29,6 +37,7 @@ class DisplayPrefs(context: Context) {
     fun save(
         stereo: Boolean,
         brightness: Int,
+        refreshHz: Int,
         ipdMeters: Float,
         distance: Float,
         height: Float,
@@ -38,6 +47,7 @@ class DisplayPrefs(context: Context) {
         prefs.edit()
             .putBoolean(STEREO, stereo)
             .putInt(BRIGHTNESS, brightness.coerceIn(0, 7))
+            .putInt(REFRESH_HZ, NrealAirProtocol.snapRefreshHz(refreshHz))
             .putFloat(IPD, ipdMeters)
             .putFloat(DIST, distance)
             .putFloat(HEIGHT, height)
@@ -50,6 +60,8 @@ class DisplayPrefs(context: Context) {
         private const val NAME = "opennebula_display"
         private const val STEREO = "stereo"
         private const val BRIGHTNESS = "brightness"
+        // v2 defaults to 90 (matched vsync); ignores old refresh_hz=120 prefs.
+        private const val REFRESH_HZ = "refresh_hz_v2"
         private const val IPD = "ipd"
         // v2 invalidates old 2.35 m defaults so the new farther layout applies once.
         private const val DIST = "distance_v2"

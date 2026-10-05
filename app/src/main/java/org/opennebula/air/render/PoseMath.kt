@@ -9,9 +9,12 @@ object StereoConfig {
     const val IPD_METERS = 0.063f
     const val IPD_MIN = 0.052f
     const val IPD_MAX = 0.078f
-    /** 46° diagonal at 16:9 → 23.53° vertical (Nreal Air). */
+    /** Physiological neck pivot: cervical spine C1/C2 is ~10cm below eyes, ~8cm behind eyes */
+    const val NECK_UP = 0.10f
+    const val NECK_FORWARD = -0.08f
+    /** 46° diagonal at 16:9 → ~23.5° vertical (Nreal Air optics). */
     const val DIAGONAL_FOV_DEG = 46f
-    const val FOVY_DEG = 23.53f
+    const val FOVY_DEG = 23.5f
     /** Optical panel aspect (each eye). HalfSBS stretches ½-buffer to this. */
     const val OPTICAL_ASPECT = 16f / 9f
     const val NEAR = 0.08f
@@ -27,6 +30,19 @@ object StereoConfig {
 }
 
 object PoseMath {
+    /**
+     * Gyro look-ahead cap for render-time pose prediction.
+     *
+     * The full pipeline from IMU packet arrival to photon-on-eye is:
+     *   IMU thread→poseRef (~1ms) + render thread wake (~1ms) + GL submit (~5ms)
+     *   + SurfaceFlinger composite (~4ms) + DP Alt Mode scanout (~8ms) + panel response (~8ms) ≈ 27ms
+     *
+     * At 90Hz display, one frame is 11.1ms stale *on average*. We target 30ms to cover
+     * worst-case frame timing without over-shooting. At 120Hz the effective need drops to ~22ms.
+     */
+    const val PREDICT_LEAD_MAX_S = 0.030f
+    const val PREDICT_LEAD_MAX_MS = 30f
+
     fun identity4(): FloatArray = floatArrayOf(
         1f, 0f, 0f, 0f,
         0f, 1f, 0f, 0f,
@@ -103,16 +119,28 @@ object PoseMath {
     }
 
     /** View matrix: inverse of head pose. Y-up, camera looks down -Z. */
-    fun viewFromOrientation(pose: Orientation): FloatArray {
-        return viewFromQuat(pose.qw, pose.qx, pose.qy, pose.qz)
+    fun viewFromOrientation(pose: Orientation, neckModel: Boolean = false): FloatArray {
+        return viewFromQuat(pose.qw, pose.qx, pose.qy, pose.qz, neckModel = neckModel)
     }
 
     /**
      * View = inverse of camera rotation. Conjugate [q], convert R(q*) to a 4x4,
      * pack column-major for `glUniformMatrix4fv` (transpose = false):
      * col0=(r00,r10,r20), col1=(r01,r11,r21), col2=(r02,r12,r22).
+     *
+     * If [neckModel] is enabled, applies anatomical neck pivot compensation:
+     * the human eye revolves around cervical spine C1/C2 (neck pivot: ~10cm below, ~8cm behind eyes).
+     * When turning head, camera translates along an arc, eliminating artificial parallax swing.
      */
-    fun viewFromQuat(qw: Float, qx: Float, qy: Float, qz: Float): FloatArray {
+    fun viewFromQuat(
+        qw: Float,
+        qx: Float,
+        qy: Float,
+        qz: Float,
+        neckModel: Boolean = false,
+        neckY: Float = StereoConfig.NECK_UP,
+        neckZ: Float = StereoConfig.NECK_FORWARD,
+    ): FloatArray {
         var w = qw
         var x = -qx
         var y = -qy
@@ -142,27 +170,73 @@ object PoseMath {
         val r20 = 2f * (xz - wy)
         val r21 = 2f * (yz + wx)
         val r22 = 1f - 2f * (xx + yy)
+
+        val tx: Float
+        val ty: Float
+        val tz: Float
+        if (neckModel) {
+            tx = r01 * neckY + r02 * neckZ
+            ty = r11 * neckY + r12 * neckZ - neckY
+            tz = r21 * neckY + r22 * neckZ - neckZ
+        } else {
+            tx = 0f
+            ty = 0f
+            tz = 0f
+        }
+
         return floatArrayOf(
             r00, r10, r20, 0f,
             r01, r11, r21, 0f,
             r02, r12, r22, 0f,
-            0f, 0f, 0f, 1f,
+            tx, ty, tz, 1f,
         )
     }
 
     /**
-     * One gyro step on a unit quat. [gx],[gy],[gz] are rad/s.
-     * Kept for unit tests / AHRS helpers — not used for display look-ahead.
+     * Exact closed-form Lie Group SO(3) exponential map:
+     * converts angular velocity vector ω (rad/s) over dt into a unit quaternion Δq.
+     */
+    fun expMap(gx: Float, gy: Float, gz: Float, dt: Float): FloatArray {
+        val dtx = gx * dt
+        val dty = gy * dt
+        val dtz = gz * dt
+        val thetaSq = dtx * dtx + dty * dty + dtz * dtz
+        if (thetaSq < 1e-12f) {
+            val s = 0.5f - thetaSq / 48f
+            return floatArrayOf(1f - thetaSq / 8f, dtx * s, dty * s, dtz * s)
+        }
+        val theta = kotlin.math.sqrt(thetaSq)
+        val half = theta * 0.5f
+        val s = kotlin.math.sin(half.toDouble()).toFloat() / theta
+        return floatArrayOf(
+            kotlin.math.cos(half.toDouble()).toFloat(),
+            dtx * s,
+            dty * s,
+            dtz * s,
+        )
+    }
+
+    /**
+     * Exact Lie Group SO(3) integration on a unit quat: q_new = q ⊗ exp(½ ω dt).
+     *
+     * Inherent norm preservation (‖Δq‖ ≡ 1), eliminating scale distortion
+     * and truncation errors during rapid head glances.
      */
     fun integrateQuat(
         qw: Float, qx: Float, qy: Float, qz: Float,
         gx: Float, gy: Float, gz: Float,
         dt: Float,
     ): FloatArray {
-        val w = qw + 0.5f * (-qx * gx - qy * gy - qz * gz) * dt
-        val x = qx + 0.5f * (qw * gx + qy * gz - qz * gy) * dt
-        val y = qy + 0.5f * (qw * gy - qx * gz + qz * gx) * dt
-        val z = qz + 0.5f * (qw * gz + qx * gy - qy * gx) * dt
+        val step = dt.coerceIn(0f, PREDICT_LEAD_MAX_S)
+        val dq = expMap(gx, gy, gz, step)
+        val dqw = dq[0]
+        val dqx = dq[1]
+        val dqy = dq[2]
+        val dqz = dq[3]
+        val w = qw * dqw - qx * dqx - qy * dqy - qz * dqz
+        val x = qw * dqx + qx * dqw + qy * dqz - qz * dqy
+        val y = qw * dqy - qx * dqz + qy * dqw + qz * dqx
+        val z = qw * dqz + qx * dqy - qy * dqx + qz * dqw
         val n = kotlin.math.sqrt(w * w + x * x + y * y + z * z)
         if (n < 1e-12f) return floatArrayOf(1f, 0f, 0f, 0f)
         val inv = 1f / n
@@ -220,10 +294,13 @@ object PoseMath {
 
     /** Un-project a head-space point (phone in the hand) into world space. */
     fun worldFromViewLocal(view: FloatArray, x: Float, y: Float, z: Float): FloatArray {
+        val rx = x - view[12]
+        val ry = y - view[13]
+        val rz = z - view[14]
         return floatArrayOf(
-            view[0] * x + view[1] * y + view[2] * z,
-            view[4] * x + view[5] * y + view[6] * z,
-            view[8] * x + view[9] * y + view[10] * z,
+            view[0] * rx + view[1] * ry + view[2] * rz,
+            view[4] * rx + view[5] * ry + view[6] * rz,
+            view[8] * rx + view[9] * ry + view[10] * rz,
         )
     }
 

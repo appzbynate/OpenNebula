@@ -12,6 +12,7 @@ object LogTags {
     const val EVENT = "OpenNebula/Event"
     const val SUMMARY = "OpenNebula/Summary"
     const val DISPLAY = "OpenNebula/Display"
+    const val FPS = "OpenNebula/Fps"
     const val PERM = "OpenNebula/Perm"
     const val UI = "OpenNebula/Ui"
     const val MIRROR = "OpenNebula/Mirror"

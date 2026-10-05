@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import os
 import socket
 import struct
 import threading
@@ -229,11 +230,27 @@ def pose_loop(stop: threading.Event, opentrack: bool, pose_map: str = "legacy") 
         ft.close_log()
 
 
+# Shared mutable target for desktop capture (phone REFRESH / DESKTOP <hz>).
+desktop_target_fps = 90.0
+desktop_fps_lock = threading.Lock()
+
+
+def set_desktop_target_fps(hz: float) -> float:
+    global desktop_target_fps
+    rate = 60.0 if hz < 75 else (90.0 if hz < 105 else 120.0)
+    with desktop_fps_lock:
+        desktop_target_fps = rate
+    print(f"[desktop] capture target → {rate:.0f} fps (match glasses refresh; avoid duplication gap)")
+    return rate
+
+
 def control_loop(stop: threading.Event) -> None:
     """Persistent line protocol on TCP :38403.
 
     LAUNCH / HELLO  → SteamVR + HMD driver
-    DESKTOP         → warm desktop capture, OK
+    DESKTOP [hz]    → switch primary to 1080p + warm capture, OK
+    REFRESH hz      → retarget desktop capture fps to glasses panel rate
+    DESKTOP_END     → restore native resolution
     PTR u v buttons [wheel]  → absolute mouse (u,v in 0..1 on primary)
     REL dx dy [buttons]      → relative mouse (trackpad)
     CLICK u v [button]
@@ -248,7 +265,7 @@ def control_loop(stop: threading.Event) -> None:
         return
     server.listen(4)
     server.settimeout(1.0)
-    print(f"[control] TCP listening 0.0.0.0:{CONTROL_PORT} (LAUNCH / DESKTOP / PTR)")
+    print(f"[control] TCP listening 0.0.0.0:{CONTROL_PORT} (LAUNCH / DESKTOP / REFRESH / PTR)")
 
     def handle_line(line: str, conn: socket.socket) -> None:
         raw = line.strip()
@@ -260,12 +277,42 @@ def control_loop(stop: threading.Event) -> None:
             print(f"[hmd] {msg}")
             conn.sendall(b"OK SteamVR launching\n")
             return
+        if upper.startswith("DESKTOP_END") or upper in ("DESKTOP END", "DESKTOP_OFF"):
+            from display_mode import restore_native_resolution
+
+            msg = restore_native_resolution()
+            print(f"[desktop] {msg}")
+            conn.sendall(f"OK {msg}\n".encode("utf-8"))
+            return
+        if upper.startswith("REFRESH"):
+            parts = raw.split()
+            hz = float(parts[1]) if len(parts) >= 2 else 90.0
+            rate = set_desktop_target_fps(hz)
+            conn.sendall(f"OK refresh {rate:.0f}\n".encode("utf-8"))
+            return
         if upper.startswith("DESKTOP"):
             from desktop_capture import primary_monitor_size, capture_note
+            from display_mode import ensure_capture_resolution
+            import win_input
 
+            parts = raw.split()
+            if len(parts) >= 2:
+                try:
+                    set_desktop_target_fps(float(parts[1]))
+                except ValueError:
+                    set_desktop_target_fps(90.0)
+            else:
+                set_desktop_target_fps(90.0)
+            mode_msg = ensure_capture_resolution()
+            print(f"[desktop] {mode_msg}")
             primary_monitor_size()
             print(f"[desktop] {capture_note()}")
-            conn.sendall(b"OK desktop ready\n")
+            try:
+                win_input.center_on_primary()
+                print("[desktop] cursor centered on primary", flush=True)
+            except OSError as err:
+                print(f"[desktop] center cursor failed: {err}", flush=True)
+            conn.sendall(f"OK desktop ready ({mode_msg})\n".encode("utf-8"))
             return
         parts = raw.split()
         cmd = parts[0].upper()
@@ -284,11 +331,35 @@ def control_loop(stop: threading.Event) -> None:
             elif cmd == "REL" and len(parts) >= 3:
                 dx = int(float(parts[1]))
                 dy = int(float(parts[2]))
-                win_input.move_rel(dx, dy)
-                if len(parts) >= 4:
-                    win_input.apply_buttons(int(float(parts[3])))
+                try:
+                    win_input.move_rel(dx, dy)
+                    n = getattr(handle_line, "_rel_n", 0) + 1
+                    handle_line._rel_n = n  # type: ignore[attr-defined]
+                    if n == 1 or n % 30 == 0:
+                        print(f"[control] REL#{n} {dx},{dy}", flush=True)
+                    try:
+                        with open(
+                            os.path.join(os.path.dirname(__file__), "rel_log.txt"),
+                            "a",
+                            encoding="utf-8",
+                        ) as f:
+                            f.write(f"{n} {dx} {dy}\n")
+                    except OSError:
+                        pass
+                    if len(parts) >= 4:
+                        win_input.apply_buttons(int(float(parts[3])))
+                except OSError as err:
+                    print(f"[control] mouse REL failed: {err}")
+                    conn.sendall(f"ERR mouse {err}\n".encode("utf-8"))
+                    return
             elif cmd == "WHEEL" and len(parts) >= 2:
                 win_input.wheel(int(float(parts[1])))
+            elif cmd == "HWHEEL" and len(parts) >= 2:
+                win_input.hwheel(int(float(parts[1])))
+            elif cmd == "ZOOM" and len(parts) >= 2:
+                win_input.zoom(int(float(parts[1])))
+            elif cmd == "CHORD" and len(parts) >= 2:
+                win_input.chord(*(int(p, 0) for p in parts[1:]))
             elif cmd == "CLICK" and len(parts) >= 3:
                 u = float(parts[1])
                 v = float(parts[2])
@@ -348,6 +419,14 @@ def _control_client(conn: socket.socket, addr, stop: threading.Event, handle_lin
             win_input.release_all()
         except Exception:
             pass
+        try:
+            from display_mode import restore_native_resolution
+
+            msg = restore_native_resolution()
+            if msg != "no saved resolution":
+                print(f"[desktop] {msg}")
+        except Exception:
+            pass
         conn.close()
         print(f"[control] client {addr[0]} gone")
 
@@ -372,8 +451,16 @@ def _latest_frame_server(
     server.listen(2)
     server.settimeout(1.0)
     lobby = make_vr_lobby_jpeg()
-    period = 0.0 if fps <= 0 else 1.0 / max(fps, 1.0)
-    print(f"[{label}] TCP listening 0.0.0.0:{port}  target={'uncapped' if period <= 0 else f'{fps:.0f} fps'} q={quality}")
+    # Desktop: start at 120 fps target; REFRESH/DESKTOP lines retarget dynamically.
+    # SteamVR / --fps 0: uncapped (period 0).
+    initial = float(fps)
+    if label == "desktop" and initial <= 0:
+        initial = desktop_target_fps
+    period_holder = [0.0 if initial <= 0 else 1.0 / max(initial, 1.0)]
+    print(
+        f"[{label}] TCP listening 0.0.0.0:{port}  "
+        f"target={'uncapped' if period_holder[0] <= 0 else f'{1.0 / period_holder[0]:.0f} fps'} q={quality}"
+    )
     while not stop.is_set():
         try:
             conn, addr = server.accept()
@@ -392,6 +479,7 @@ def _latest_frame_server(
             latest_jpeg: list[bytes | None] = [lobby]
             latest_lock_v = threading.Lock()
             gen = [0]
+            frame_ready = threading.Event()
             conn_stop = threading.Event()
 
             def capture_worker() -> None:
@@ -401,23 +489,29 @@ def _latest_frame_server(
                     with latest_lock_v:
                         latest_jpeg[0] = jpeg
                         gen[0] += 1
+                    frame_ready.set()
+                    if label == "desktop":
+                        with desktop_fps_lock:
+                            tgt = desktop_target_fps
+                        period_holder[0] = 0.0 if tgt <= 0 else 1.0 / max(tgt, 1.0)
+                    period = period_holder[0]
                     if period > 0:
                         remain = period - (time.time() - t0)
-                        if remain > 0.001:
+                        if remain > 0.0005:
                             time.sleep(remain)
-                    else:
-                        time.sleep(0.0)
+                    # else: full-tilt — no sleep
 
             cap_t = threading.Thread(target=capture_worker, name=f"{label}-cap", daemon=True)
             cap_t.start()
             sent_gen = -1
             try:
                 while not stop.is_set():
+                    frame_ready.wait(timeout=0.05)
+                    frame_ready.clear()
                     with latest_lock_v:
                         g = gen[0]
                         jpeg = latest_jpeg[0]
                     if jpeg is None or g == sent_gen:
-                        time.sleep(0.001)
                         continue
                     sent_gen = g
                     header = struct.pack("<II", MAGIC_U32, len(jpeg))
@@ -454,9 +548,19 @@ def desktop_video_loop(stop: threading.Event, fps: float, quality: int) -> None:
 
     primary_monitor_size()
     print(f"[desktop] {capture_note()}")
+    # Prefer glasses-matched rate (default 90). Uncapped CLI --fps 0 starts at 90 for desktop.
+    if fps <= 0:
+        set_desktop_target_fps(90.0)
+        fps = 90.0
+    else:
+        set_desktop_target_fps(fps)
 
     def grab(q: int):
-        return grab_desktop_jpeg(quality=q, max_w=1280)
+        # Slightly lighter encode when chasing 120 so capture can keep up.
+        with desktop_fps_lock:
+            tgt = desktop_target_fps
+        max_w = 1600 if tgt >= 110 else 1920
+        return grab_desktop_jpeg(quality=q, max_w=max_w)
 
     _latest_frame_server(stop, DESKTOP_VIDEO_PORT, "desktop", grab, fps, quality)
 
@@ -488,8 +592,8 @@ def main() -> None:
     ]
     if not args.no_video:
         threads.append(threading.Thread(target=video_loop, args=(stop, args.fps, args.quality), daemon=True))
-        # Desktop panel: slightly higher JPEG quality is fine at 1280px; still uncapped.
-        desk_q = min(max(args.quality + 10, 40), 55)
+        # Desktop: gaming latency — 1080p + moderate JPEG 4:2:0 (was q75–88 4:4:4).
+        desk_q = min(max(args.quality + 15, 48), 58)
         threads.append(
             threading.Thread(target=desktop_video_loop, args=(stop, args.fps, desk_q), daemon=True),
         )
@@ -511,6 +615,12 @@ def main() -> None:
             time.sleep(1)
     except KeyboardInterrupt:
         stop.set()
+        try:
+            from display_mode import restore_native_resolution
+
+            print(f"[desktop] {restore_native_resolution()}")
+        except Exception:
+            pass
         print("bye")
 
 
